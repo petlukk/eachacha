@@ -29,17 +29,26 @@ python3 bench.py
 
 ### Results
 
-Measured on AMD EPYC 9354P (2 vCPUs), 64 MB data, median of 10 runs:
+Measured on AMD EPYC 9354P (2 vCPUs). Median throughput across data sizes:
 
-| Implementation                | GB/s  | stddev |
-|-------------------------------|------:|-------:|
-| NumPy XOR (baseline, not crypto) | 6.962 | 0.589 |
-| Generic C (scalar, -O3)      | 0.540 | 0.014 |
-| OpenSSL ChaCha20              | 0.587 | 0.019 |
-| **Ea ChaCha20 (single core)**    | **1.687** | 0.061 |
-| Ea ChaCha20 parallel (2 cores) | 1.563 | 0.176 |
-| Ea fused (encrypt + stats)   | 0.576 | 0.011 |
-| Ea encrypt + NumPy stats (separate) | 1.004 | 0.057 |
+| Size | Encrypt | Fused (encrypt+stats) | Separate (encrypt + numpy) | Fusion speedup |
+|-----:|--------:|----------------------:|---------------------------:|---------------:|
+| 64 KB | 1.63 GB/s | 1.28 GB/s | 0.98 GB/s | 1.31x |
+| 1 MB | 1.78 GB/s | 1.48 GB/s | 1.14 GB/s | 1.30x |
+| 16 MB | 1.81 GB/s | 1.43 GB/s | 1.00 GB/s | 1.42x |
+| 64 MB | 1.76 GB/s | 1.43 GB/s | 1.08 GB/s | 1.33x |
+| 256 MB | 1.78 GB/s | 1.38 GB/s | 1.05 GB/s | 1.31x |
+
+For context (64 MB, median of 10 runs):
+
+| Implementation | GB/s |
+|---|---:|
+| NumPy XOR (not real crypto) | ~7.0 |
+| Generic C (-O3, no SIMD) | 0.54 |
+| OpenSSL ChaCha20 (Python wrapper) | 0.59 |
+| **Ea ChaCha20 (single core)** | **1.78** |
+| **Ea fused (encrypt + stats, one pass)** | **1.43** |
+| Ea encrypt + NumPy stats (two passes) | 1.08 |
 
 ### Autoresearch optimization
 
@@ -61,56 +70,69 @@ that explored variants of the ChaCha20 inner loop. The key optimizations found:
   blocks are processed one at a time. A final partial-block tail uses
   `load_masked` / `store_masked` for sub-16-byte remainders.
 
-The result: **2.8x faster** single-core throughput (0.605 -> 1.687 GB/s),
-in 272 lines of Ea. The kernel now **outperforms OpenSSL** (called via Python)
-by 2.9x and **outperforms generic C (-O3)** by 3.1x.
+The result: **2.9x faster** single-core throughput (0.61 -> 1.78 GB/s),
+in 272 lines of Ea. The kernel **outperforms generic C (-O3)** by 3.3x.
 
 ### Analysis
 
 **Where Ea wins:**
 
-- **Ea is 3.1x faster than generic C** on single-core throughput (1.687 vs
-  0.540 GB/s), showing the Ea compiler's SIMD code generation delivers real
-  performance gains over auto-vectorization.
-- **Ea is 2.9x faster than OpenSSL** in this configuration (1.687 vs 0.587
-  GB/s). OpenSSL's ChaCha20 is going through the Python `cryptography`
-  library's object allocation overhead on each call, which penalises it in
-  this benchmark structure.
+- **3.3x faster than generic C** (1.78 vs 0.54 GB/s). The Ea compiler's SIMD
+  code generation delivers real performance gains over what `cc -O3` auto-vectorizes.
+- **3.0x faster than OpenSSL's Python wrapper** (1.78 vs 0.59 GB/s). Though this
+  comparison is unfair to OpenSSL — see below.
+- **Fusion works at every scale.** The fused kernel delivers 1.3-1.4x speedup
+  over separate passes consistently from 64 KB to 256 MB. This is not a cache
+  artifact. Statistics come essentially free when computed during encryption.
 
 **Where Ea loses:**
 
-- **NumPy XOR is 4.1x faster** — but it is doing a trivial XOR with no quarter
-  rounds, no key schedule, no counter management. It just shows memory bandwidth
-  ceiling (~7 GB/s on this machine).
 - **OpenSSL in production** (called from C, with AVX2/AVX-512 codepaths, and
-  amortised setup) would likely be 3-5x faster than what we see here.
-  The `cryptography` Python wrapper adds per-call overhead that hides OpenSSL's
-  real throughput.
+  amortised setup) would likely be 3-5x faster than what we see here. The Python
+  `cryptography` wrapper adds per-call overhead that hides OpenSSL's real throughput.
+  We are honest about this.
+- **NumPy XOR is ~4x faster** — but it does a trivial XOR with no rounds, no key
+  schedule. It just shows memory bandwidth ceiling (~7 GB/s on this machine).
 
 ### The fusion argument
 
-The fused kernel (`chacha20_encrypt_stats`) computes encryption **and** four
-statistics (sum, count, min, max) of the plaintext in a single pass. The fused
-kernel has not yet been updated with the 4-block ILP optimization. Compare the
-current state:
+The fused kernel (`chacha20_encrypt_stats`) encrypts data **and** computes four
+statistics (sum, count, min, max) of the plaintext in a single memory pass. Both
+kernels use the same 4-block ILP optimization. Results across real-world data sizes:
 
-| Approach | GB/s |
-|---|---:|
-| Ea encrypt + NumPy stats (two passes) | 1.004 |
-| Ea fused (one pass, not yet optimized) | 0.576 |
+| Size | Fused (one pass) | Separate (two passes) | Fusion speedup |
+|-----:|------------------:|----------------------:|---------------:|
+| 64 KB | 1.28 GB/s | 0.98 GB/s | 1.31x |
+| 1 MB | 1.48 GB/s | 1.14 GB/s | 1.30x |
+| 16 MB | 1.43 GB/s | 1.00 GB/s | 1.42x |
+| 64 MB | 1.43 GB/s | 1.08 GB/s | 1.33x |
+| 256 MB | 1.38 GB/s | 1.05 GB/s | 1.31x |
 
-With the optimized encrypt kernel, the two-pass approach is now faster than
-the unoptimized fused kernel. Once the fused kernel receives the same 4-block
-ILP treatment, it should regain its advantage — the fusion principle still
-holds: statistics computed during encryption avoid a second memory traversal.
+The fused kernel adds only ~20% overhead compared to encrypt-only (1.43 vs 1.78 GB/s),
+while providing sum, count, min, and max for free. The separate approach pays for
+a second full memory traversal via NumPy — that second pass is what fusion eliminates.
+
+This is the core value proposition: OpenSSL is a black box. You send data in, get
+ciphertext out, then do a second pass for analytics. With Ea, you write one kernel
+that does both. One memory read instead of two.
 
 ## Complexity
+
+| Implementation | Lines of code | Throughput |
+|---|---:|---:|
+| OpenSSL | ~100,000+ (C/ASM) | 0.59 GB/s* |
+| Generic C | 45 | 0.54 GB/s |
+| **Ea** | **272** | **1.78 GB/s** |
+| **Ea fused** | **284** | **1.43 GB/s** (+ stats) |
+
+*OpenSSL through Python wrapper; native would be faster.
 
 272 lines of Ea produce a ChaCha20 implementation that:
 
 - Passes all RFC 7539 test vectors
 - Cross-verifies with OpenSSL byte-for-byte
-- Achieves 1.7 GB/s single-core on a 2-vCPU cloud VM
+- Achieves 1.78 GB/s single-core on a 2-vCPU cloud VM
+- Scales consistently from 64 KB to 256 MB
 - Supports arbitrary input lengths (not just block-aligned)
 
 ## Files

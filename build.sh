@@ -6,11 +6,11 @@ EA="${EA:-/root/dev/eacompute/target/release/ea}"
 cd "$SCRIPT_DIR"
 
 echo "Building chacha20.ea..."
-$EA chacha20.ea --lib
+$EA chacha20.ea --lib --opt-level=3
 $EA bind chacha20.ea --python
 
 echo "Building chacha20_fused.ea..."
-$EA chacha20_fused.ea --lib
+$EA chacha20_fused.ea --lib --opt-level=3
 $EA bind chacha20_fused.ea --python
 
 echo "Building chacha20_ref.c..."

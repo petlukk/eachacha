@@ -21,11 +21,13 @@ _lib.chacha20_encrypt.argtypes = [
 ]
 _lib.chacha20_encrypt.restype = None
 
-# Set up argtypes for fused
+# Set up argtypes for fused (14 params: key, nonce, counter, pt, ct, len,
+#   ks_i32, ks_u8, pt_i32, ct_i32, out_sum, out_count, out_min, out_max)
 _fused.chacha20_encrypt_stats.argtypes = [
     ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32), ct.c_int32,
     ct.POINTER(ct.c_uint8), ct.POINTER(ct.c_uint8), ct.c_int32,
     ct.POINTER(ct.c_int32), ct.POINTER(ct.c_uint8),
+    ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32),
     ct.POINTER(ct.c_int64), ct.POINTER(ct.c_int32),
     ct.POINTER(ct.c_uint8), ct.POINTER(ct.c_uint8),
 ]
@@ -98,6 +100,8 @@ nonce2 = to_i32_array(ENC_NONCE_U32)
 pt_buf2 = (ct.c_uint8 * pt_len)(*PLAINTEXT)
 ct_buf2 = (ct.c_uint8 * pt_len)()
 s2, ks2_i32, ks2_u8 = make_scratch()
+pt2_i32 = ct.cast(pt_buf2, ct.POINTER(ct.c_int32))
+ct2_i32 = ct.cast(ct_buf2, ct.POINTER(ct.c_int32))
 out_sum = (ct.c_int64 * 1)()
 out_count = (ct.c_int32 * 1)()
 out_min = (ct.c_uint8 * 1)()
@@ -106,6 +110,7 @@ out_max = (ct.c_uint8 * 1)()
 _fused.chacha20_encrypt_stats(
     key2, nonce2, ct.c_int32(ENC_COUNTER),
     pt_buf2, ct_buf2, ct.c_int32(pt_len), ks2_i32, ks2_u8,
+    pt2_i32, ct2_i32,
     ct.cast(out_sum, ct.POINTER(ct.c_int64)),
     ct.cast(out_count, ct.POINTER(ct.c_int32)),
     ct.cast(out_min, ct.POINTER(ct.c_uint8)),
@@ -171,9 +176,12 @@ for size in [0, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 256, 1000]:
         _lib.chacha20_encrypt(to_i32_array(KEY_U32), to_i32_array(ENC_NONCE_U32),
                               ct.c_int32(ENC_COUNTER), pt_t, ct_t1, ct.c_int32(0),
                               ks_t1_i32, ks_t1_u8, pt_t_i32, ct_t1_i32)
+        pt_t2_i32 = ct.cast(pt_t, ct.POINTER(ct.c_int32))
+        ct_t2_i32 = ct.cast(ct_t2, ct.POINTER(ct.c_int32))
         _fused.chacha20_encrypt_stats(
             to_i32_array(KEY_U32), to_i32_array(ENC_NONCE_U32), ct.c_int32(ENC_COUNTER),
             pt_t, ct_t2, ct.c_int32(0), ks_t2_i32, ks_t2_u8,
+            pt_t2_i32, ct_t2_i32,
             ct.cast(o_sum, ct.POINTER(ct.c_int64)),
             ct.cast(o_count, ct.POINTER(ct.c_int32)),
             ct.cast(o_min, ct.POINTER(ct.c_uint8)),
@@ -200,13 +208,17 @@ for size in [0, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 256, 1000]:
     # Fused
     ct_f = (ct.c_uint8 * size)()
     s_f, ks_f_i32, ks_f_u8 = make_scratch()
+    pt_f_buf = (ct.c_uint8 * size)(*data)
+    pt_f_i32 = ct.cast(pt_f_buf, ct.POINTER(ct.c_int32))
+    ct_f_i32 = ct.cast(ct_f, ct.POINTER(ct.c_int32))
     o_s = (ct.c_int64 * 1)()
     o_c = (ct.c_int32 * 1)()
     o_mn = (ct.c_uint8 * 1)(255)
     o_mx = (ct.c_uint8 * 1)(0)
     _fused.chacha20_encrypt_stats(
         to_i32_array(KEY_U32), to_i32_array(ENC_NONCE_U32), ct.c_int32(ENC_COUNTER),
-        (ct.c_uint8 * size)(*data), ct_f, ct.c_int32(size), ks_f_i32, ks_f_u8,
+        pt_f_buf, ct_f, ct.c_int32(size), ks_f_i32, ks_f_u8,
+        pt_f_i32, ct_f_i32,
         ct.cast(o_s, ct.POINTER(ct.c_int64)),
         ct.cast(o_c, ct.POINTER(ct.c_int32)),
         ct.cast(o_mn, ct.POINTER(ct.c_uint8)),

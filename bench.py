@@ -6,8 +6,17 @@ import sys
 import time
 import platform
 import statistics
+import resource
+import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+
+# Ensure sufficient stack for SIMD kernels processing large buffers
+_soft, _hard = resource.getrlimit(resource.RLIMIT_STACK)
+_target = 64 * 1024 * 1024
+if _soft != resource.RLIM_INFINITY and _soft < _target:
+    _new = _target if _hard == resource.RLIM_INFINITY else min(_target, _hard)
+    resource.setrlimit(resource.RLIMIT_STACK, (_new, _hard))
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,6 +61,7 @@ _ea.chacha20_encrypt.argtypes = [
     ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32), ct.c_int32,
     ct.POINTER(ct.c_uint8), ct.POINTER(ct.c_uint8), ct.c_int32,
     ct.POINTER(ct.c_int32), ct.POINTER(ct.c_uint8),
+    ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32),
 ]
 _ea.chacha20_encrypt.restype = None
 
@@ -171,10 +181,12 @@ def bench_ea_single():
     scratch, ks_i32, ks_u8 = make_scratch()
     pt_ptr = plaintext.ctypes.data_as(ct.POINTER(ct.c_uint8))
     ct_ptr = ciphertext.ctypes.data_as(ct.POINTER(ct.c_uint8))
+    pt_i32 = ct.cast(pt_ptr, ct.POINTER(ct.c_int32))
+    ct_i32 = ct.cast(ct_ptr, ct.POINTER(ct.c_int32))
     def fn():
         _ea.chacha20_encrypt(key_arr, nonce_arr, ct.c_int32(1),
                              pt_ptr, ct_ptr, ct.c_int32(DATA_SIZE),
-                             ks_i32, ks_u8)
+                             ks_i32, ks_u8, pt_i32, ct_i32)
     return bench("Ea ChaCha20 (single core)", fn)
 
 # ---------------------------------------------------------------------------
@@ -200,10 +212,14 @@ def bench_ea_parallel():
                       ct.POINTER(ct.c_uint8))
         dst = ct.cast(ct.addressof(ct.c_uint8.from_buffer(ciphertext, byte_offset)),
                       ct.POINTER(ct.c_uint8))
+        src_i32 = ct.cast(src, ct.POINTER(ct.c_int32))
+        dst_i32 = ct.cast(dst, ct.POINTER(ct.c_int32))
         _ea.chacha20_encrypt(key_arr, nonce_arr, ct.c_int32(start_block),
-                             src, dst, ct.c_int32(byte_len), ti32, tu8)
+                             src, dst, ct.c_int32(byte_len), ti32, tu8,
+                             src_i32, dst_i32)
 
     def fn():
+        threading.stack_size(64 * 1024 * 1024)
         with ThreadPoolExecutor(max_workers=NCORES) as pool:
             futures = [pool.submit(work, tid) for tid in range(NCORES)]
             for f in futures:
@@ -243,10 +259,12 @@ def bench_ea_plus_numpy_stats():
     scratch, ks_i32, ks_u8 = make_scratch()
     pt_ptr = plaintext.ctypes.data_as(ct.POINTER(ct.c_uint8))
     ct_ptr = ciphertext.ctypes.data_as(ct.POINTER(ct.c_uint8))
+    pt_i32 = ct.cast(pt_ptr, ct.POINTER(ct.c_int32))
+    ct_i32 = ct.cast(ct_ptr, ct.POINTER(ct.c_int32))
     def fn():
         _ea.chacha20_encrypt(key_arr, nonce_arr, ct.c_int32(1),
                              pt_ptr, ct_ptr, ct.c_int32(DATA_SIZE),
-                             ks_i32, ks_u8)
+                             ks_i32, ks_u8, pt_i32, ct_i32)
         np.sum(plaintext)
         np.min(plaintext)
         np.max(plaintext)

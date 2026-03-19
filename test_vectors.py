@@ -21,6 +21,7 @@ _lib.chacha20_encrypt.argtypes = [
     ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32), ct.c_int32,
     ct.POINTER(ct.c_uint8), ct.POINTER(ct.c_uint8), ct.c_int32,
     ct.POINTER(ct.c_int32), ct.POINTER(ct.c_uint8),
+    ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32),
 ]
 _lib.chacha20_encrypt.restype = None
 
@@ -155,11 +156,13 @@ pt_len = len(PLAINTEXT)
 pt_buf = (ct.c_uint8 * pt_len)(*PLAINTEXT)
 ct_buf = (ct.c_uint8 * pt_len)()
 scratch, ks_i32, ks_u8 = make_scratch()
+pt_i32 = ct.cast(pt_buf, ct.POINTER(ct.c_int32))
+ct_i32 = ct.cast(ct_buf, ct.POINTER(ct.c_int32))
 
 _lib.chacha20_encrypt(
     key_enc, nonce_enc, ct.c_int32(ENC_COUNTER),
     pt_buf, ct_buf, ct.c_int32(pt_len),
-    ks_i32, ks_u8,
+    ks_i32, ks_u8, pt_i32, ct_i32,
 )
 
 got_ct = bytes(ct_buf)
@@ -181,11 +184,13 @@ check("ciphertext matches RFC 7539 s2.4.2", got_ct == expected_ct)
 pt_buf2 = (ct.c_uint8 * pt_len)(*got_ct)
 dec_buf = (ct.c_uint8 * pt_len)()
 scratch2, ks_i32_2, ks_u8_2 = make_scratch()
+pt_i32_2 = ct.cast(pt_buf2, ct.POINTER(ct.c_int32))
+ct_i32_2 = ct.cast(dec_buf, ct.POINTER(ct.c_int32))
 
 _lib.chacha20_encrypt(
     to_i32_array(KEY_U32), to_i32_array(ENC_NONCE_U32), ct.c_int32(ENC_COUNTER),
     pt_buf2, dec_buf, ct.c_int32(pt_len),
-    ks_i32_2, ks_u8_2,
+    ks_i32_2, ks_u8_2, pt_i32_2, ct_i32_2,
 )
 check("decrypt(encrypt(pt)) == pt", bytes(dec_buf) == PLAINTEXT)
 
@@ -219,11 +224,13 @@ try:
     pt_buf3 = (ct.c_uint8 * pt_len)(*ossl_ct)
     dec_buf3 = (ct.c_uint8 * pt_len)()
     scratch3, ks_i32_3, ks_u8_3 = make_scratch()
+    pt_i32_3 = ct.cast(pt_buf3, ct.POINTER(ct.c_int32))
+    ct_i32_3 = ct.cast(dec_buf3, ct.POINTER(ct.c_int32))
 
     _lib.chacha20_encrypt(
         to_i32_array(KEY_U32), to_i32_array(ENC_NONCE_U32), ct.c_int32(ENC_COUNTER),
         pt_buf3, dec_buf3, ct.c_int32(pt_len),
-        ks_i32_3, ks_u8_3,
+        ks_i32_3, ks_u8_3, pt_i32_3, ct_i32_3,
     )
     check("OpenSSL encrypt -> Eä decrypt == plaintext", bytes(dec_buf3) == PLAINTEXT,
           f"got: {bytes(dec_buf3)!r}")

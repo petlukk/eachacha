@@ -17,6 +17,7 @@ _lib.chacha20_encrypt.argtypes = [
     ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32), ct.c_int32,
     ct.POINTER(ct.c_uint8), ct.POINTER(ct.c_uint8), ct.c_int32,
     ct.POINTER(ct.c_int32), ct.POINTER(ct.c_uint8),
+    ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32),
 ]
 _lib.chacha20_encrypt.restype = None
 
@@ -85,8 +86,11 @@ pt_buf1 = (ct.c_uint8 * pt_len)(*PLAINTEXT)
 ct_buf1 = (ct.c_uint8 * pt_len)()
 s1, ks1_i32, ks1_u8 = make_scratch()
 
+pt1_i32 = ct.cast(pt_buf1, ct.POINTER(ct.c_int32))
+ct1_i32 = ct.cast(ct_buf1, ct.POINTER(ct.c_int32))
 _lib.chacha20_encrypt(key1, nonce1, ct.c_int32(ENC_COUNTER),
-                      pt_buf1, ct_buf1, ct.c_int32(pt_len), ks1_i32, ks1_u8)
+                      pt_buf1, ct_buf1, ct.c_int32(pt_len), ks1_i32, ks1_u8,
+                      pt1_i32, ct1_i32)
 
 # Fused
 key2 = to_i32_array(KEY_U32)
@@ -162,9 +166,11 @@ for size in [0, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 256, 1000]:
         o_min = (ct.c_uint8 * 1)(255)
         o_max = (ct.c_uint8 * 1)(0)
 
+        pt_t_i32 = ct.cast(pt_t, ct.POINTER(ct.c_int32))
+        ct_t1_i32 = ct.cast(ct_t1, ct.POINTER(ct.c_int32))
         _lib.chacha20_encrypt(to_i32_array(KEY_U32), to_i32_array(ENC_NONCE_U32),
                               ct.c_int32(ENC_COUNTER), pt_t, ct_t1, ct.c_int32(0),
-                              ks_t1_i32, ks_t1_u8)
+                              ks_t1_i32, ks_t1_u8, pt_t_i32, ct_t1_i32)
         _fused.chacha20_encrypt_stats(
             to_i32_array(KEY_U32), to_i32_array(ENC_NONCE_U32), ct.c_int32(ENC_COUNTER),
             pt_t, ct_t2, ct.c_int32(0), ks_t2_i32, ks_t2_u8,
@@ -183,10 +189,13 @@ for size in [0, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 256, 1000]:
     # Non-fused
     ct_nf = (ct.c_uint8 * size)()
     s_nf, ks_nf_i32, ks_nf_u8 = make_scratch()
+    pt_nf_buf = (ct.c_uint8 * size)(*data)
+    pt_nf_i32 = ct.cast(pt_nf_buf, ct.POINTER(ct.c_int32))
+    ct_nf_i32 = ct.cast(ct_nf, ct.POINTER(ct.c_int32))
     _lib.chacha20_encrypt(to_i32_array(KEY_U32), to_i32_array(ENC_NONCE_U32),
                           ct.c_int32(ENC_COUNTER),
-                          (ct.c_uint8 * size)(*data), ct_nf, ct.c_int32(size),
-                          ks_nf_i32, ks_nf_u8)
+                          pt_nf_buf, ct_nf, ct.c_int32(size),
+                          ks_nf_i32, ks_nf_u8, pt_nf_i32, ct_nf_i32)
 
     # Fused
     ct_f = (ct.c_uint8 * size)()

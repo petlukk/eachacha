@@ -118,14 +118,15 @@ that does both. One memory read instead of two.
 
 ## Complexity
 
-| Implementation | Lines of code | Throughput |
-|---|---:|---:|
-| OpenSSL | ~100,000+ (C/ASM) | 0.59 GB/s* |
-| Generic C | 45 | 0.54 GB/s |
-| **Ea** | **272** | **1.78 GB/s** |
-| **Ea fused** | **284** | **1.43 GB/s** (+ stats) |
+| Implementation | Lines of code | Encrypt | Encrypt + stats |
+|---|---:|---:|---:|
+| OpenSSL + NumPy | ~100,000+ (C/ASM) | 0.59 GB/s* | 0.52 GB/s** |
+| Generic C + NumPy | 45 | 0.54 GB/s | 0.48 GB/s** |
+| **Ea (separate)** | **272 + numpy** | **1.78 GB/s** | **1.05 GB/s** |
+| **Ea (fused)** | **284** | — | **1.43 GB/s** |
 
 *OpenSSL through Python wrapper; native would be faster.
+**Estimated: encrypt then `np.sum/min/max` on plaintext.
 
 272 lines of Ea produce a ChaCha20 implementation that:
 

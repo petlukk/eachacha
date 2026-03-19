@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-EA="${EA:-/root/dev/eacompute/target/release/ea}"
+EA="${EA:-ea}"
 
 cd "$SCRIPT_DIR"
 

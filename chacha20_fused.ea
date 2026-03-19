@@ -1,0 +1,210 @@
+// chacha20_fused.ea — Fused ChaCha20 encrypt + plaintext statistics kernel
+// Produces byte-identical ciphertext to chacha20.ea, plus sum/count/min/max
+// of plaintext bytes in a single pass (one memory read).
+
+// Rotation helpers — copied from chacha20.ea (mask to neutralize arithmetic shift)
+func rotl16(v: i32x4) -> i32x4 {
+    let sl: i32x4 = splat(16)
+    let left: i32x4 = v .<< sl
+    let right: i32x4 = v .>> sl
+    let mask: i32x4 = splat(65535)
+    return left .| (right .& mask)
+}
+
+func rotl12(v: i32x4) -> i32x4 {
+    let sl: i32x4 = splat(12)
+    let sr: i32x4 = splat(20)
+    let left: i32x4 = v .<< sl
+    let right: i32x4 = v .>> sr
+    let mask: i32x4 = splat(4095)
+    return left .| (right .& mask)
+}
+
+func rotl8(v: i32x4) -> i32x4 {
+    let sl: i32x4 = splat(8)
+    let sr: i32x4 = splat(24)
+    let left: i32x4 = v .<< sl
+    let right: i32x4 = v .>> sr
+    let mask: i32x4 = splat(255)
+    return left .| (right .& mask)
+}
+
+func rotl7(v: i32x4) -> i32x4 {
+    let sl: i32x4 = splat(7)
+    let sr: i32x4 = splat(25)
+    let left: i32x4 = v .<< sl
+    let right: i32x4 = v .>> sr
+    let mask: i32x4 = splat(127)
+    return left .| (right .& mask)
+}
+
+// Internal block function (not exported) — identical to chacha20_block
+func chacha20_block(key: *i32, nonce: *i32, counter: i32, out: *mut i32) {
+    let row0_init: i32x4 = [1634760805, 857760878, 2036477234, 1797285236]i32x4
+    let row1_init: i32x4 = load(key, 0)
+    let row2_init: i32x4 = load(key, 4)
+
+    store(out, 0, splat(counter))
+    out[1] = nonce[0]
+    out[2] = nonce[1]
+    out[3] = nonce[2]
+    let row3_init: i32x4 = load(out, 0)
+
+    store(out, 0, row0_init)
+    store(out, 4, row1_init)
+    store(out, 8, row2_init)
+    store(out, 12, row3_init)
+
+    let mut round: i32 = 0
+    while round < 10 {
+        let mut r0: i32x4 = load(out, 0)
+        let mut r1: i32x4 = load(out, 4)
+        let mut r2: i32x4 = load(out, 8)
+        let mut r3: i32x4 = load(out, 12)
+
+        // Column round
+        r0 = r0 .+ r1
+        r3 = rotl16(r3 .^ r0)
+        r2 = r2 .+ r3
+        r1 = rotl12(r1 .^ r2)
+        r0 = r0 .+ r1
+        r3 = rotl8(r3 .^ r0)
+        r2 = r2 .+ r3
+        r1 = rotl7(r1 .^ r2)
+
+        // Diagonal round: shuffle
+        r1 = shuffle(r1, [1, 2, 3, 0])
+        r2 = shuffle(r2, [2, 3, 0, 1])
+        r3 = shuffle(r3, [3, 0, 1, 2])
+
+        r0 = r0 .+ r1
+        r3 = rotl16(r3 .^ r0)
+        r2 = r2 .+ r3
+        r1 = rotl12(r1 .^ r2)
+        r0 = r0 .+ r1
+        r3 = rotl8(r3 .^ r0)
+        r2 = r2 .+ r3
+        r1 = rotl7(r1 .^ r2)
+
+        // Unshuffle
+        r1 = shuffle(r1, [3, 0, 1, 2])
+        r2 = shuffle(r2, [2, 3, 0, 1])
+        r3 = shuffle(r3, [1, 2, 3, 0])
+
+        store(out, 0, r0)
+        store(out, 4, r1)
+        store(out, 8, r2)
+        store(out, 12, r3)
+
+        round = round + 1
+    }
+
+    let final0: i32x4 = load(out, 0) .+ row0_init
+    let final1: i32x4 = load(out, 4) .+ row1_init
+    let final2: i32x4 = load(out, 8) .+ row2_init
+    let final3: i32x4 = load(out, 12) .+ row3_init
+
+    store(out, 0, final0)
+    store(out, 4, final1)
+    store(out, 8, final2)
+    store(out, 12, final3)
+}
+
+// Sum all 16 bytes of a u8x16 vector, returning i32
+func sum_u8x16(chunk: u8x16) -> i32 {
+    let w0: i32x4 = widen_u8_i32x4(chunk)
+    let s1: u8x16 = shuffle(chunk, [4,5,6,7, 0,1,2,3, 8,9,10,11, 12,13,14,15])
+    let w1: i32x4 = widen_u8_i32x4(s1)
+    let s2: u8x16 = shuffle(chunk, [8,9,10,11, 0,1,2,3, 4,5,6,7, 12,13,14,15])
+    let w2: i32x4 = widen_u8_i32x4(s2)
+    let s3: u8x16 = shuffle(chunk, [12,13,14,15, 0,1,2,3, 4,5,6,7, 8,9,10,11])
+    let w3: i32x4 = widen_u8_i32x4(s3)
+    return reduce_add(w0) + reduce_add(w1) + reduce_add(w2) + reduce_add(w3)
+}
+
+// Fused ChaCha20 encrypt + statistics
+export func chacha20_encrypt_stats(
+    key: *i32, nonce: *i32, counter: i32,
+    plaintext: *u8, ciphertext: *mut u8, len: i32,
+    ks_i32: *mut i32, ks_u8: *u8,
+    out_sum: *mut i64, out_count: *mut i32,
+    out_min: *mut u8, out_max: *mut u8
+) {
+    let mut offset: i32 = 0
+    let mut ctr: i32 = counter
+    let mut running_sum: i64 = to_i64(0)
+    let mut running_count: i32 = 0
+    let mut running_min: u8 = 255
+    let mut running_max: u8 = 0
+
+    while offset < len {
+        // Generate keystream block
+        chacha20_block(key, nonce, ctr, ks_i32)
+
+        let remaining: i32 = len - offset
+
+        // Process full 16-byte u8x16 chunks within this 64-byte block
+        let mut chunk_off: i32 = 0
+        while chunk_off + 16 <= 64 {
+            if offset + chunk_off + 16 <= len {
+                let pt: u8x16 = load(plaintext, offset + chunk_off)
+                let ks: u8x16 = load(ks_u8, chunk_off)
+                store(ciphertext, offset + chunk_off, pt .^ ks)
+
+                // Stats on plaintext chunk
+                let cmin: u8 = reduce_min(pt)
+                let cmax: u8 = reduce_max(pt)
+                if cmin < running_min {
+                    running_min = cmin
+                }
+                if cmax > running_max {
+                    running_max = cmax
+                }
+                let chunk_sum: i32 = sum_u8x16(pt)
+                running_sum = running_sum + to_i64(chunk_sum)
+                running_count = running_count + 16
+            }
+            chunk_off = chunk_off + 16
+        }
+
+        // Handle partial tail if remaining < 64
+        if remaining < 64 {
+            let full_bytes: i32 = remaining - (remaining - ((remaining / 16) * 16))
+            let tail_count: i32 = remaining - full_bytes
+            if tail_count > 0 {
+                let tail_off: i32 = offset + full_bytes
+                let ks_tail: u8x16 = load_masked(ks_u8, full_bytes, tail_count)
+                let pt_tail: u8x16 = load_masked(plaintext, tail_off, tail_count)
+                store_masked(ciphertext, tail_off, pt_tail .^ ks_tail, tail_count)
+
+                // Stats on masked tail — only valid bytes matter
+                // reduce_min/reduce_max on masked load: zeroed lanes would corrupt min/max
+                // We must process byte-by-byte for correctness on the tail
+                let mut ti: i32 = 0
+                let mut tail_sum: i32 = 0
+                while ti < tail_count {
+                    let b: u8 = plaintext[tail_off + ti]
+                    tail_sum = tail_sum + to_i32(b)
+                    if b < running_min {
+                        running_min = b
+                    }
+                    if b > running_max {
+                        running_max = b
+                    }
+                    ti = ti + 1
+                }
+                running_sum = running_sum + to_i64(tail_sum)
+                running_count = running_count + tail_count
+            }
+        }
+
+        offset = offset + 64
+        ctr = ctr + 1
+    }
+
+    // Write outputs
+    out_sum[0] = running_sum
+    out_count[0] = running_count
+    out_min[0] = running_min
+    out_max[0] = running_max
+}

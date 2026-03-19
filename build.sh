@@ -9,6 +9,10 @@ echo "Building chacha20.ea..."
 $EA chacha20.ea --lib
 $EA bind chacha20.ea --python
 
+echo "Building chacha20_fused.ea..."
+$EA chacha20_fused.ea --lib
+$EA bind chacha20_fused.ea --python
+
 echo "Building chacha20_ref.c..."
 cc -O3 -shared -fPIC -o libchacha20_ref.so chacha20_ref.c
 

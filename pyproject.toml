@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eachacha"
-version = "1.0.3"
+version = "1.0.4"
 description = "ChaCha20 SIMD kernels in Eä — encrypt, fused stats, and searchable cipher"
 readme = "README.md"
 license = {text = "MIT"}
@@ -27,4 +27,4 @@ Repository = "https://github.com/petlukk/eachacha"
 where = ["src"]
 
 [tool.setuptools.package-data]
-eachacha = ["lib/*.so"]
+eachacha = ["lib/*.so", "lib/*.dll"]

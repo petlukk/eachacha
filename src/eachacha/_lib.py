@@ -1,13 +1,15 @@
 """Load pre-built shared libraries from the lib/ directory."""
 
 import ctypes as ct
+import sys
 from pathlib import Path
 
 _LIB_DIR = Path(__file__).parent / "lib"
+_EXT = ".dll" if sys.platform == "win32" else ".so"
 
 
 def _load(name):
-    path = _LIB_DIR / f"{name}.so"
+    path = _LIB_DIR / f"{name}{_EXT}"
     if not path.exists():
         raise RuntimeError(
             f"Shared library not found: {path}. "

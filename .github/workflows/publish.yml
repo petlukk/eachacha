@@ -55,48 +55,13 @@ jobs:
           name: wheel-linux-x86_64
           path: dist/*.whl
 
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download ea binary
-        shell: pwsh
-        run: |
-          Invoke-WebRequest `
-            "https://github.com/$env:EA_REPO/releases/download/$env:EA_VERSION/ea-windows-x86_64.zip" `
-            -OutFile ea.zip
-          Expand-Archive ea.zip -DestinationPath .
-          Move-Item ea-windows-x86_64\ea.exe .\ea.exe
-
-      - name: Compile kernels (generic x86-64)
-        shell: bash
-        run: |
-          for k in chacha20 chacha20_search chacha20_search_v2; do
-            ./ea.exe ${k}.ea --lib --opt-level=3 --target=x86-64
-          done
-          mkdir -p src/eachacha/lib
-          cp chacha20.dll chacha20_search.dll chacha20_search_v2.dll src/eachacha/lib/
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Build and retag wheel
-        shell: pwsh
-        run: |
-          pip install build wheel
-          python -m build --wheel
-          python -m wheel tags --platform-tag win_amd64 --remove (Get-ChildItem dist\eachacha-*.whl).FullName
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-windows
-          path: dist/*.whl
+  # Windows wheel blocked by eacompute issue: __chkstk not linked for
+  # kernels with large stack frames (4-block ILP uses 16+ i32x4 vars).
+  # TODO: fix ea --lib to link msvcrt.lib on Windows, then re-enable.
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
-    needs: [build-linux-x86_64, build-windows]
+    needs: [build-linux-x86_64]
     runs-on: ubuntu-24.04
     environment: pypi
     steps:

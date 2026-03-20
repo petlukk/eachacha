@@ -19,6 +19,12 @@ if [ -f chacha20_search.ea ]; then
   $EA bind chacha20_search.ea --python
 fi
 
+if [ -f chacha20_search_v2.ea ]; then
+  echo "Building chacha20_search_v2.ea..."
+  $EA chacha20_search_v2.ea --lib --opt-level=3
+  $EA bind chacha20_search_v2.ea --python
+fi
+
 echo "Building chacha20_ref.c..."
 cc -O3 -shared -fPIC -o libchacha20_ref.so chacha20_ref.c
 

@@ -17,7 +17,7 @@ jobs:
         run: pip install ea-compiler build
       - name: Build kernels (generic x86-64)
         run: |
-          EA=$(python -c "import ea; print(ea._compiler._find_binary())")
+          EA=$(python -c "import ea._compiler; print(ea._compiler._ea_binary())")
           $EA chacha20.ea --lib --opt-level=3 --target=x86-64
           $EA chacha20_search.ea --lib --opt-level=3 --target=x86-64
           $EA chacha20_search_v2.ea --lib --opt-level=3 --target=x86-64
@@ -47,7 +47,7 @@ jobs:
       - name: Build kernels (generic x86-64)
         shell: bash
         run: |
-          EA=$(python -c "import ea; print(ea._compiler._find_binary())")
+          EA=$(python -c "import ea._compiler; print(ea._compiler._ea_binary())")
           "$EA" chacha20.ea --lib --opt-level=3 --target=x86-64
           "$EA" chacha20_search.ea --lib --opt-level=3 --target=x86-64
           "$EA" chacha20_search_v2.ea --lib --opt-level=3 --target=x86-64

@@ -57,8 +57,8 @@ Fuses ChaCha20 decryption with streaming string search. Structure mirrors `chach
 
 ```
 chacha20_search(
-    key: *restrict u8,           // 32-byte key
-    nonce: *restrict u8,         // 12-byte nonce
+    key: *restrict i32,          // 32-byte key (i32 for ChaCha20 state loads)
+    nonce: *restrict i32,        // 12-byte nonce (i32 for ChaCha20 state loads)
     ctr: i32,                    // initial counter
     ct_u8: *restrict u8,         // ciphertext input
     len: i32,                    // ciphertext length
@@ -78,18 +78,22 @@ chacha20_search(
 
 ### Three-Tier Processing (matches existing kernels)
 
+**Early exit:** If `needle_len == 0`, set `*match_count = 0` and return immediately.
+
+**Overlap buffer persists across all three tiers.** The same overlap state carries from the last Tier 1 iteration into the first Tier 2 iteration, and from the last Tier 2 iteration into Tier 3.
+
 **Tier 1: 4-block hot loop (256 bytes per iteration)**
-1. Decrypt 4 blocks via i32x4 ILP XOR → store to `pt_i32` (same as fused kernel stores to ct_i32)
-2. Search the overlap buffer: scan `overlap[0..needle_len-2]` + first `needle_len-1` bytes of `pt_buf` for boundary-spanning matches (scalar, at most 63+63 = 126 bytes, skipped on first iteration)
+1. Decrypt 4 blocks: read from `ct_i32`, XOR with i32x4 keystream, store to `pt_i32` (decrypt direction: ct → pt, opposite of encrypt kernels which do pt → ct)
+2. Search the overlap region: scan starting positions `0` through `needle_len - 2` in the concatenated `overlap[0..needle_len-2] + pt_buf[0..needle_len-2]` region for boundary-spanning matches (scalar, skipped on first iteration when overlap is empty)
 3. Search `pt_buf[0..255]` using XOR + reduce_min fast-skip per u8x16 chunk, scalar verify on candidates
 4. Save last `needle_len - 1` bytes of `pt_buf` into `overlap`
 5. Zero `pt_buf` (security hygiene)
 
 **Tier 2: Single-block loop (64 bytes)**
-Same pattern for remaining full blocks after the 4-block loop exhausts.
+Same decrypt → overlap-search → main-search → save-overlap → zero pattern, operating on 64-byte chunks within `pt_buf`. Overlap carries from Tier 1.
 
 **Tier 3: Sub-block tail (< 64 bytes)**
-Generate keystream via `chacha20_block()` into `ks_i32`, XOR with ciphertext byte-by-byte, search the partial block. Handle overlap from previous tier.
+Generate keystream via `chacha20_block()` into `ks_i32`, XOR with ciphertext byte-by-byte into `pt_buf`, search the partial block. Handle overlap from Tier 2. No SIMD fast-skip (tail is < 64 bytes, not worth it). Zero `pt_buf` and `overlap` after final search (security: clear both buffers on exit).
 
 ### Search Algorithm
 
@@ -101,7 +105,7 @@ if reduce_min(xored) != 0:
     skip  // no byte in this chunk matches needle[0]
 ```
 
-When `reduce_min` is nonzero, no byte equals `needle[0]` — skip the entire 16-byte chunk. For random data with a specific first byte, ~93.5% of chunks are skipped (1 - (1 - 1/256)^16 ≈ 6.1% hit rate).
+When `reduce_min` is nonzero, no byte equals `needle[0]` — skip the entire 16-byte chunk. For random data with a specific first byte, ~93.5% of chunks are skipped (1 - (1 - 1/256)^16 ≈ 6.1% hit rate). Note: real ASCII log data is biased toward printable characters, so hit rates will be higher (e.g., 'E' appears more often than 1/256). The fast-skip is still beneficial but less dominant on real text.
 
 **Scalar verify (when chunk has candidates):**
 
@@ -121,7 +125,7 @@ This is simple and correct. The fast-skip ensures the scalar path is rarely take
 overlap[0..needle_len-2]  // last bytes from previous iteration
 ```
 
-At the start of each iteration (except the first), concatenate `overlap` with the first `needle_len - 1` bytes of the new `pt_buf` and scan this `2*(needle_len-1)` byte region for matches. Scalar scan, at most 126 bytes — negligible cost.
+At the start of each iteration (except the first), concatenate `overlap` with the first `needle_len - 1` bytes of the new `pt_buf`. Scan only starting positions `0` through `needle_len - 2` in this concatenated region — later positions fall entirely within `pt_buf` and will be found by the main search. This avoids double-counting.
 
 The overlap buffer is initialized empty (length 0). On the first iteration, the overlap scan is skipped.
 
@@ -132,6 +136,8 @@ if *match_count < max_matches:
     matches[*match_count] = global_byte_offset
     *match_count += 1
 ```
+
+**Global offset tracking:** The kernel maintains `iter_base` = byte offset of the current iteration's start within the ciphertext. For main-search matches: `global_byte_offset = iter_base + position_within_pt_buf`. For overlap matches: `global_byte_offset = iter_base - (needle_len - 1) + position_within_overlap_region`.
 
 Kernel initializes `*match_count = 0` on entry. The `max_matches` parameter prevents buffer overflow.
 

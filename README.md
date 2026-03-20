@@ -9,7 +9,7 @@ pip install eachacha
 ## Quick Start
 
 ```python
-from eachacha import encrypt, decrypt, search, search_multi
+from eachacha import encrypt, search
 
 key = bytes(range(32))     # 32-byte key
 nonce = bytes(12)          # 12-byte nonce
@@ -21,8 +21,8 @@ ct = encrypt(b"INFO ok\nERROR disk full\nINFO done\n", key, nonce)
 result = search(ct, b"ERROR", key, nonce)
 print(result.offsets)  # [8]
 
-# Multi-needle search with context lines
-result = search_multi(ct, [b"ERROR", b"INFO"], key, nonce)
+# Multi-needle search with context lines (auto-selects v2 kernel)
+result = search(ct, [b"ERROR", b"INFO"], key, nonce)
 for i, line in enumerate(result.lines):
     print(f"[{result.needle_ids[i]}] {line}")
 ```

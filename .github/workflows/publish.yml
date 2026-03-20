@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 jobs:
-  build-linux:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,41 +35,8 @@ jobs:
           name: wheel-linux
           path: dist/*.whl
 
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install ea-compiler and build tools
-        run: pip install ea-compiler build
-      - name: Build kernels (generic x86-64)
-        shell: bash
-        run: |
-          EA=$(python -c "import ea._compiler; print(ea._compiler._ea_binary())")
-          "$EA" chacha20.ea --lib --opt-level=3 --target=x86-64
-          "$EA" chacha20_search.ea --lib --opt-level=3 --target=x86-64
-          "$EA" chacha20_search_v2.ea --lib --opt-level=3 --target=x86-64
-          mkdir -p src/eachacha/lib
-          cp chacha20.dll chacha20_search.dll chacha20_search_v2.dll src/eachacha/lib/ 2>/dev/null || \
-          cp chacha20.so chacha20_search.so chacha20_search_v2.so src/eachacha/lib/
-      - name: Build wheel
-        run: python -m build --wheel
-      - name: Fix platform tag
-        shell: bash
-        run: |
-          cd dist
-          for f in *-py3-none-any.whl; do
-            mv "$f" "${f/py3-none-any/py3-none-win_amd64}"
-          done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-windows
-          path: dist/*.whl
-
   publish:
-    needs: [build-linux, build-windows]
+    needs: [build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

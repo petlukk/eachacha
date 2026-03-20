@@ -572,5 +572,12 @@ export func chacha20_search(
         oi = oi + 1
     }
 
+    // Zero keystream buffer (ks_i32 may contain ChaCha20 keystream after Tier 3)
+    let ks_zero: i32x4 = [0, 0, 0, 0]i32x4
+    store(ks_i32, 0, ks_zero)
+    store(ks_i32, 4, ks_zero)
+    store(ks_i32, 8, ks_zero)
+    store(ks_i32, 12, ks_zero)
+
     match_count[0] = mc
 }

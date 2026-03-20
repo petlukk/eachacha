@@ -721,7 +721,28 @@ export func chacha20_search_v2(
             }
         }
 
+        // Phase 6: Zero pt_buf (security — plaintext must not persist)
+        let zero_vec: i32x4 = [0, 0, 0, 0]i32x4
+        let mut zi: i32 = 0
+        let zero_elems: i32 = wsize / 16
+        while zi < zero_elems {
+            store(pt_i32, zi * 4, zero_vec)
+            zi = zi + 1
+        }
+        let mut zbi: i32 = zero_elems * 16
+        while zbi < wsize {
+            pt_buf[zbi] = 0
+            zbi = zbi + 1
+        }
+
         global_offset = global_offset + wsize
+    }
+
+    // Zero overlap on exit (may contain plaintext from last window)
+    let mut oi: i32 = 0
+    while oi < overlap_len {
+        overlap[oi] = 0
+        oi = oi + 1
     }
 
     match_count[0] = mc

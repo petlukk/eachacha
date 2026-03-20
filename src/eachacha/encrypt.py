@@ -1,7 +1,6 @@
 """ChaCha20 encrypt/decrypt via Eä SIMD kernel."""
 
 import ctypes as ct
-import numpy as np
 
 from ._lib import get_encrypt_lib, key_nonce_from_bytes
 

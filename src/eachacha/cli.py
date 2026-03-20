@@ -22,6 +22,6 @@ def main():
     else:
         print("eachacha-grep: use 'python3 eachacha_grep.py' from the project directory,",
               file=sys.stderr)
-        print("or use the Python API: from eachacha import search, search_multi",
+        print("or use the Python API: from eachacha import search",
               file=sys.stderr)
         sys.exit(1)

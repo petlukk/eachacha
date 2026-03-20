@@ -76,13 +76,6 @@ func sum_u8x16(chunk: u8x16) -> i32 {
     return reduce_add(w0) + reduce_add(w1) + reduce_add(w2) + reduce_add(w3)
 }
 
-// Accumulate stats for one u8x16 plaintext chunk
-func stats_chunk(chunk: u8x16, running_min: u8, running_max: u8) -> u8x16 {
-    // Returns a dummy vector; actual min/max/sum done at call site.
-    // (Ea has no tuples, so we inline at call sites instead.)
-    return chunk
-}
-
 // Fused ChaCha20 encrypt + statistics — 4-block ILP hot loop
 export func chacha20_encrypt_stats(
     key: *restrict i32, nonce: *restrict i32, counter: i32,

@@ -84,12 +84,17 @@ AMD EPYC 9354P (2 vCPUs), 64 MB:
 | Working buffer | Zeroed after each iteration |
 | Plaintext on disk | Never written |
 | Kernel output | Match offsets + extracted lines only |
+| Keystream buffer | Zeroed on exit |
+
+**Not provided:** This is ChaCha20 only — no authentication (no Poly1305/AEAD). An attacker can flip ciphertext bits to deterministically flip plaintext bits. For integrity guarantees, use ChaCha20-Poly1305 for encryption and verify the tag before searching. This tool assumes the ciphertext is authentic.
+
+**Not constant-time:** The search comparison uses early-exit on mismatch. This leaks timing information correlated with partial matches. Since the tool's purpose is to reveal match positions, this is acceptable — but do not use the search kernel as a general-purpose constant-time comparison.
 
 ### How It Works
 
-**v1 kernel** (`chacha20_search.ea`, 576 lines): Decrypts 256 bytes at a time, searches with `.==` + `movemask` SIMD first-byte filter (same algorithm as glibc memmem: `vpcmpeqb` + `vpmovmskb`), handles cross-block boundaries via overlap buffer.
+**v1 kernel** (`chacha20_search.ea`, 583 lines): Decrypts 256 bytes at a time, searches with `.==` + `movemask` SIMD first-byte filter (same algorithm as glibc memmem: `vpcmpeqb` + `vpmovmskb`), handles cross-block boundaries via overlap buffer.
 
-**v2 kernel** (`chacha20_search_v2.ea`, 866 lines): Decrypts into a 4 KB window, searches for multiple needles by OR:ing `.==` + `movemask` bitmasks per unique first-byte, extracts matched log lines by finding `\n` boundaries with the same SIMD primitives.
+**v2 kernel** (`chacha20_search_v2.ea`, 750 lines): Decrypts into a 4 KB window, searches for multiple needles by OR:ing `.==` + `movemask` bitmasks per unique first-byte, extracts matched log lines by finding `\n` boundaries with the same SIMD primitives.
 
 ## Encrypt + Statistics
 
@@ -110,12 +115,12 @@ Fusion adds ~20% overhead vs encrypt-only. The separate approach pays for a seco
 | Kernel | Lines | Throughput |
 |---|---:|---:|
 | `chacha20.ea` (encrypt) | 272 | 1.78 GB/s |
-| `chacha20_fused.ea` (encrypt+stats) | 384 | 1.43 GB/s |
-| `chacha20_search.ea` (v1 search) | 576 | 1.28 GB/s |
-| `chacha20_search_v2.ea` (v2 multi-needle) | 866 | 0.52 GB/s |
-| **Total** | **2,098** | |
+| `chacha20_fused.ea` (encrypt+stats) | 376 | 1.43 GB/s |
+| `chacha20_search.ea` (v1 search) | 583 | 1.28 GB/s |
+| `chacha20_search_v2.ea` (v2 multi-needle) | 750 | 0.52 GB/s |
+| **Total** | **1,981** | |
 
-2,098 lines of Eä produce four production-grade kernels. For comparison, OpenSSL's ChaCha20 alone is ~100,000+ lines of C/ASM.
+~2,000 lines of Eä produce four kernels. For comparison, OpenSSL's ChaCha20 alone is ~100,000+ lines of C/ASM.
 
 ## Build from Source
 
@@ -135,10 +140,10 @@ python3 test_vectors.py && python3 test_fused.py && python3 test_search.py && py
 | `chacha20_search.ea` | v1: single-needle fused decrypt+search |
 | `chacha20_search_v2.ea` | v2: multi-needle + context-line extraction |
 | `eachacha_grep.py` | CLI for searching encrypted files |
-| `test_vectors.py` | RFC 7539 test vectors + OpenSSL cross-check (8 tests) |
-| `test_fused.py` | Fused encrypt+stats tests (19 tests) |
-| `test_search.py` | v1 search tests (17 tests, 38 assertions) |
-| `test_search_v2.py` | v2 search tests (27 tests, 44 assertions) |
+| `test_vectors.py` | RFC 7539 test vectors + OpenSSL cross-check (4 tests, 9 assertions) |
+| `test_fused.py` | Fused encrypt+stats tests (3 tests, 8 assertions) |
+| `test_search.py` | v1 search tests (17 tests, 21 assertions) |
+| `test_search_v2.py` | v2 search tests (27 tests, 43 assertions) |
 | `bench.py` | Encrypt benchmark suite |
 | `bench_search.py` | v1 search benchmark suite |
 | `bench_search_v2.py` | v2 multi-needle benchmark suite |

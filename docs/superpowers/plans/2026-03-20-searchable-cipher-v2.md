@@ -69,7 +69,8 @@ if [ -f "$OUT" ]; then
 fi
 
 echo "Downloading NASA HTTP access log (July 1995)..."
-curl -L -o "$OUT.gz" "$URL"
+curl -L -o "$OUT.gz" "$URL" \
+    || curl -L -o "$OUT.gz" "ftp://ita.ee.lbl.gov/traces/NASA_access_log_Jul95.gz"
 gunzip "$OUT.gz"
 echo "Downloaded: $OUT ($(wc -c < "$OUT") bytes)"
 ```
@@ -96,6 +97,10 @@ git commit -m "build: add v2 kernel build lines and NASA download script"
 ## Task 2: Write the v2 kernel — decrypt window + multi-needle search helpers
 
 The kernel is large (~700-800 lines). This task writes the helper functions and the decrypt-window-fill logic. Task 3 adds context-line extraction. Task 4 wires everything into the main export.
+
+**Ea stack array allocation:** Ea supports fixed-size local arrays via pointer parameters allocated by the caller. For the unique first-byte dedup, the main export function receives a caller-allocated scratch buffer. Alternatively, if Ea supports `let mut arr: [u8; 64]` style stack arrays, use those. The implementor should test both approaches. If neither works, add `unique_fb: *restrict mut u8` (64 bytes) and `fb_scratch: *restrict mut i32` (256 bytes) as additional parameters.
+
+**Simplification note:** For v2 with ≤64 needles, the `search_buf_multi_simd` verify loop tests ALL needles at each candidate position (guarded by first-byte equality check). This is O(needles) per candidate but with the first-byte guard, only needles sharing the matched first-byte are fully verified. The spec's `fb_needle_map` optimization is deferred — for 3-5 needles the per-candidate cost is negligible. If profiling shows the verify is a bottleneck, add the map in a follow-up.
 
 **Files:**
 - Create: `chacha20_search_v2.ea`
@@ -248,20 +253,54 @@ func search_buf_multi_simd(
         }
     }
 
-    // Remaining < 16 bytes — delegate to scalar
-    if chunk_off < buf_len {
-        mc = search_buf_multi(buf, buf_len, needles, needle_offsets, needle_lens, needle_count,
-                              matches, needle_ids_out, mc, max_matches, base_offset + chunk_off - chunk_off)
-        // NOTE: Actually need to offset buf pointer. Since Ea doesn't have pointer arithmetic,
-        // the scalar fallback should scan from chunk_off to buf_len within the same buffer.
-        // Rewrite: inline the scalar tail here, scanning from chunk_off to buf_len.
+    // Remaining < 16 bytes — inline scalar scan (can't call search_buf_multi
+    // with offset because Ea lacks pointer arithmetic)
+    let mut ti: i32 = chunk_off
+    while ti < buf_len {
+        if mc >= max_matches {
+            return mc
+        }
+        let tb: u8 = buf[ti]
+        let mut tni: i32 = 0
+        while tni < needle_count {
+            let tnlen: i32 = needle_lens[tni]
+            let tnoff: i32 = needle_offsets[tni]
+            if ti + tnlen <= buf_len {
+                let tfirst: u8 = needles[tnoff]
+                if !(tb < tfirst) && !(tfirst < tb) {
+                    let mut tj: i32 = 1
+                    let mut tmatched: i32 = 1
+                    while tj < tnlen {
+                        let tbj: u8 = buf[ti + tj]
+                        let tnj: u8 = needles[tnoff + tj]
+                        if tbj < tnj {
+                            tmatched = 0
+                            tj = tnlen
+                        } else {
+                            if tnj < tbj {
+                                tmatched = 0
+                                tj = tnlen
+                            }
+                        }
+                        tj = tj + 1
+                    }
+                    if tmatched == 1 {
+                        if mc < max_matches {
+                            matches[mc] = base_offset + ti
+                            needle_ids_out[mc] = tni
+                            mc = mc + 1
+                        }
+                    }
+                }
+            }
+            tni = tni + 1
+        }
+        ti = ti + 1
     }
 
     return mc
 }
 ```
-
-**Important:** The scalar tail at the end of `search_buf_multi_simd` cannot call `search_buf_multi` with an offset into `buf` because Ea lacks pointer arithmetic. Instead, inline a scalar scan loop from `chunk_off` to `buf_len` directly in the function (same logic as `search_buf_multi` but starting at `chunk_off` instead of 0). The `base_offset` for this tail section is `base_offset + chunk_off`. During implementation, the agent should handle this by writing the tail loop inline.
 
 - [ ] **Step 4: Write search_overlap_multi — multi-needle overlap search**
 
@@ -347,49 +386,66 @@ git commit -m "feat(v2): kernel scaffolding — multi-needle search helpers + st
 
 ```ea
 // Find the start of the line containing position `pos` in buf.
-// Scans backward for \n using .== + movemask. Returns position after \n,
-// or 0 if no \n found (truncated line start).
-// max_scan limits backward scan distance.
+// Scans backward from pos-1 for \n using .== + movemask.
+// Returns position after \n, or 0 if no \n found (truncated line start).
+// max_scan limits backward scan distance. Does NOT check buf[pos] itself.
 func find_line_start(buf: *mut u8, pos: i32, max_scan: i32) -> i32 {
-    let newline_splat: u8x16 = splat(10)
-    let scan_limit: i32 = pos - max_scan
-    let mut scan_pos: i32 = pos - 16
-    // SIMD scan backward in 16-byte chunks
-    while scan_pos >= 0 && scan_pos >= scan_limit {
-        let chunk: u8x16 = load(buf, scan_pos)
-        let bits: i32 = movemask(chunk .== newline_splat)
-        if bits != 0 {
-            // Find highest set bit = rightmost \n in this chunk
-            // Count from bit 15 down to 0
-            let mut bit: i32 = 15
-            while bit >= 0 {
-                if (bits .>> bit) .& 1 != 0 {
-                    let nl_pos: i32 = scan_pos + bit
-                    if nl_pos < pos {
-                        return nl_pos + 1  // line starts after \n
-                    }
-                }
-                bit = bit - 1
-            }
-        }
-        scan_pos = scan_pos - 16
-    }
-    // Scalar scan for remaining bytes between scan_limit and last SIMD chunk
-    let scalar_start: i32 = pos - 1
-    let scalar_end: i32 = scan_limit
-    let mut si: i32 = scalar_start
     let nl_byte: u8 = 10
-    while si >= 0 && si >= scalar_end {
+    let newline_splat: u8x16 = splat(nl_byte)
+    let mut scan_end: i32 = pos - max_scan
+    if scan_end < 0 {
+        scan_end = 0
+    }
+
+    // Scalar scan from pos-1 down to the nearest 16-byte aligned position
+    // (avoids SIMD/scalar overlap by handling unaligned head first)
+    let mut si: i32 = pos - 1
+    let aligned_start: i32 = (si / 16) * 16  // round down to 16-byte boundary
+    while si >= aligned_start && si >= scan_end {
         if !(buf[si] < nl_byte) && !(nl_byte < buf[si]) {
             return si + 1
         }
         si = si - 1
     }
-    return 0  // truncated: no \n found
+
+    // SIMD scan backward in 16-byte aligned chunks
+    let mut chunk_pos: i32 = aligned_start - 16
+    while chunk_pos >= scan_end {
+        let chunk: u8x16 = load(buf, chunk_pos)
+        let bits: i32 = movemask(chunk .== newline_splat)
+        if bits != 0 {
+            // Find highest set bit = rightmost \n in this chunk
+            let mut bit: i32 = 15
+            while bit >= 0 {
+                if (bits / (1 .<< bit)) .& 1 != 0 {
+                    return chunk_pos + bit + 1  // line starts after \n
+                }
+                bit = bit - 1
+            }
+        }
+        chunk_pos = chunk_pos - 16
+    }
+
+    // Scalar scan for bytes between scan_end and last SIMD chunk
+    while si >= scan_end {
+        if !(buf[si] < nl_byte) && !(nl_byte < buf[si]) {
+            return si + 1
+        }
+        si = si - 1
+    }
+
+    return scan_end  // truncated: no \n found within max_scan
 }
 ```
 
-**Note:** The backward scan with `movemask` and bit extraction is tricky. The `bits .>> bit` approach finds the highest set bit position. The agent should verify this compiles — `i32` shift operators (`.>>`) are available in Ea. If `bits .>> bit` doesn't work on scalar i32, use a loop checking `bits .& (1 .<< bit)` or similar.
+**Notes on find_line_start:**
+- Scans from `pos-1` (never checks `buf[pos]` itself — pos is the match position)
+- Scalar head handles unaligned bytes above the nearest 16-byte boundary
+- SIMD handles aligned chunks below that
+- Scalar tail handles remaining bytes near `scan_end`
+- No overlap between SIMD and scalar regions
+- `bits / (1 .<< bit)` is integer division to extract bit — if Ea supports `bits .>> bit` on scalar i32, use that instead. The implementor should test both.
+- Returns `scan_end` (not 0) when no \n found, limiting to the window boundary
 
 - [ ] **Step 2: Write find_line_end — forward \n search with SIMD**
 
@@ -550,11 +606,21 @@ while global_offset < len:
     // Simpler approach: search first (get all match positions), then extract lines
     old_mc = mc
     mc = search_buf_multi_simd(pt_buf, window_fill, ..., mc, max_matches, global_offset)
-    // Extract lines for new matches
-    for each match from old_mc to mc:
-        match_pos_in_buf = match_offsets[i] - global_offset
-        if can_write_line:
-            extract_line(pt_buf, window_fill, match_pos_in_buf, ...)
+
+    // Extract lines for new matches — track write_pos and lines_written
+    let mut ei: i32 = old_mc
+    while ei < mc {
+        let match_pos_in_buf: i32 = match_offsets[ei] - global_offset
+        if extract_line(pt_buf, window_fill, match_pos_in_buf, max_line_len,
+                       lines_buf, lines_buf_cap, write_pos,
+                       line_offsets, line_lens, lw) == 1 {
+            write_pos = write_pos + line_lens[lw]
+            lw = lw + 1
+        }
+        ei = ei + 1
+    }
+    // (For overlap matches where match_pos_in_buf < 0, skip line extraction,
+    //  set line_lens to 0 — Python handles these via targeted decrypt)
 
     // Phase 4: Save overlap (last max_needle_len - 1 bytes)
     // Phase 5: Zero pt_buf

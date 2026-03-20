@@ -60,7 +60,7 @@ This means `pt_buf` must be at least `window_size` bytes (caller-allocated, defa
 
 **Security:** The window is zeroed after each search phase. Max plaintext in memory: `window_size` bytes (4 KB default) vs v1's 256 bytes. Still a 25-million-fold reduction vs full-file decryption for a 100 GB file.
 
-### Signature (24 parameters)
+### Signature (26 parameters)
 
 ```
 export func chacha20_search_v2(

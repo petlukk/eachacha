@@ -1,0 +1,429 @@
+// chacha20_search_v2.ea — Fused ChaCha20 decrypt + multi-needle search + context-line extraction
+// v2: searches for multiple needles using OR:ed .== + movemask per unique first-byte,
+// extracts matched log lines by finding \n boundaries with SIMD primitives.
+
+// Rotation helpers — identical to v1
+func rotl16(v: i32x4) -> i32x4 {
+    return (v .<< splat(16)) .| ((v .>> splat(16)) .& splat(65535))
+}
+
+func rotl12(v: i32x4) -> i32x4 {
+    return (v .<< splat(12)) .| ((v .>> splat(20)) .& splat(4095))
+}
+
+func rotl8(v: i32x4) -> i32x4 {
+    return (v .<< splat(8)) .| ((v .>> splat(24)) .& splat(255))
+}
+
+func rotl7(v: i32x4) -> i32x4 {
+    return (v .<< splat(7)) .| ((v .>> splat(25)) .& splat(127))
+}
+
+// Internal single-block function for tail handling
+func chacha20_block(key: *i32, nonce: *i32, counter: i32, out: *mut i32) {
+    let row0_init: i32x4 = [1634760805, 857760878, 2036477234, 1797285236]i32x4
+    let row1_init: i32x4 = load(key, 0)
+    let row2_init: i32x4 = load(key, 4)
+    let n0: i32 = nonce[0]
+    let n1: i32 = nonce[1]
+    let n2: i32 = nonce[2]
+    let row3_init: i32x4 = [counter, n0, n1, n2]i32x4
+    let mut r0: i32x4 = row0_init
+    let mut r1: i32x4 = row1_init
+    let mut r2: i32x4 = row2_init
+    let mut r3: i32x4 = row3_init
+    let mut round: i32 = 0
+    while round < 10 {
+        r0 = r0 .+ r1
+        r3 = rotl16(r3 .^ r0)
+        r2 = r2 .+ r3
+        r1 = rotl12(r1 .^ r2)
+        r0 = r0 .+ r1
+        r3 = rotl8(r3 .^ r0)
+        r2 = r2 .+ r3
+        r1 = rotl7(r1 .^ r2)
+        r1 = shuffle(r1, [1, 2, 3, 0])
+        r2 = shuffle(r2, [2, 3, 0, 1])
+        r3 = shuffle(r3, [3, 0, 1, 2])
+        r0 = r0 .+ r1
+        r3 = rotl16(r3 .^ r0)
+        r2 = r2 .+ r3
+        r1 = rotl12(r1 .^ r2)
+        r0 = r0 .+ r1
+        r3 = rotl8(r3 .^ r0)
+        r2 = r2 .+ r3
+        r1 = rotl7(r1 .^ r2)
+        r1 = shuffle(r1, [3, 0, 1, 2])
+        r2 = shuffle(r2, [2, 3, 0, 1])
+        r3 = shuffle(r3, [1, 2, 3, 0])
+        round = round + 1
+    }
+    store(out, 0, r0 .+ row0_init)
+    store(out, 4, r1 .+ row1_init)
+    store(out, 8, r2 .+ row2_init)
+    store(out, 12, r3 .+ row3_init)
+}
+
+// ============================================================================
+// Multi-needle search helpers
+// ============================================================================
+
+// Search buf for multiple needles. For each position, test all needles whose
+// first byte matches. Returns updated match_count.
+// needle_ids_out[mc] = index of matching needle.
+func search_buf_multi(
+    buf: *mut u8, buf_len: i32,
+    needles: *restrict u8, needle_offsets: *restrict i32,
+    needle_lens: *restrict i32, needle_count: i32,
+    matches: *restrict mut i32, needle_ids_out: *restrict mut i32,
+    match_count: i32, max_matches: i32,
+    base_offset: i32
+) -> i32 {
+    let mut mc: i32 = match_count
+    // For each position in buf, check all needles
+    let mut pos: i32 = 0
+    while pos < buf_len {
+        if mc >= max_matches {
+            return mc
+        }
+        let b: u8 = buf[pos]
+        let mut ni: i32 = 0
+        while ni < needle_count {
+            let nlen: i32 = needle_lens[ni]
+            let noff: i32 = needle_offsets[ni]
+            if pos + nlen <= buf_len {
+                let first: u8 = needles[noff]
+                if !(b < first) && !(first < b) {
+                    // First byte matches — verify rest
+                    let mut j: i32 = 1
+                    let mut matched: i32 = 1
+                    while j < nlen {
+                        let bj: u8 = buf[pos + j]
+                        let nj: u8 = needles[noff + j]
+                        if bj < nj {
+                            matched = 0
+                            j = nlen
+                        } else {
+                            if nj < bj {
+                                matched = 0
+                                j = nlen
+                            }
+                        }
+                        j = j + 1
+                    }
+                    if matched == 1 {
+                        if mc < max_matches {
+                            matches[mc] = base_offset + pos
+                            needle_ids_out[mc] = ni
+                            mc = mc + 1
+                        }
+                    }
+                }
+            }
+            ni = ni + 1
+        }
+        pos = pos + 1
+    }
+    return mc
+}
+
+// SIMD multi-needle search: OR:ed .== + movemask per unique first-byte.
+func search_buf_multi_simd(
+    buf: *mut u8, buf_len: i32,
+    needles: *restrict u8, needle_offsets: *restrict i32,
+    needle_lens: *restrict i32, needle_count: i32,
+    unique_fb: *restrict u8, unique_count: i32,
+    matches: *restrict mut i32, needle_ids_out: *restrict mut i32,
+    match_count: i32, max_matches: i32,
+    base_offset: i32
+) -> i32 {
+    let mut mc: i32 = match_count
+    let mut chunk_off: i32 = 0
+
+    while chunk_off + 16 <= buf_len {
+        if mc >= max_matches {
+            return mc
+        }
+        let chunk: u8x16 = load(buf, chunk_off)
+
+        // OR bitmasks for all unique first-bytes
+        let mut bits: i32 = 0
+        let mut fi: i32 = 0
+        while fi < unique_count {
+            bits = bits + movemask(chunk .== splat(unique_fb[fi]))
+            fi = fi + 1
+        }
+
+        if bits == 0 {
+            chunk_off = chunk_off + 16
+        } else {
+            // Scalar verify in this 16-byte region
+            let scan_end: i32 = chunk_off + 16
+            let mut i: i32 = chunk_off
+            while i < scan_end {
+                if mc >= max_matches {
+                    return mc
+                }
+                let b: u8 = buf[i]
+                let mut ni: i32 = 0
+                while ni < needle_count {
+                    let nlen: i32 = needle_lens[ni]
+                    let noff: i32 = needle_offsets[ni]
+                    if i + nlen <= buf_len {
+                        let first: u8 = needles[noff]
+                        if !(b < first) && !(first < b) {
+                            let mut j: i32 = 1
+                            let mut matched: i32 = 1
+                            while j < nlen {
+                                let bj: u8 = buf[i + j]
+                                let nj: u8 = needles[noff + j]
+                                if bj < nj {
+                                    matched = 0
+                                    j = nlen
+                                } else {
+                                    if nj < bj {
+                                        matched = 0
+                                        j = nlen
+                                    }
+                                }
+                                j = j + 1
+                            }
+                            if matched == 1 {
+                                if mc < max_matches {
+                                    matches[mc] = base_offset + i
+                                    needle_ids_out[mc] = ni
+                                    mc = mc + 1
+                                }
+                            }
+                        }
+                    }
+                    ni = ni + 1
+                }
+                i = i + 1
+            }
+            chunk_off = scan_end
+        }
+    }
+
+    // Remaining < 16 bytes — inline scalar scan (can't call search_buf_multi
+    // with offset because Ea lacks pointer arithmetic)
+    let mut ti: i32 = chunk_off
+    while ti < buf_len {
+        if mc >= max_matches {
+            return mc
+        }
+        let tb: u8 = buf[ti]
+        let mut tni: i32 = 0
+        while tni < needle_count {
+            let tnlen: i32 = needle_lens[tni]
+            let tnoff: i32 = needle_offsets[tni]
+            if ti + tnlen <= buf_len {
+                let tfirst: u8 = needles[tnoff]
+                if !(tb < tfirst) && !(tfirst < tb) {
+                    let mut tj: i32 = 1
+                    let mut tmatched: i32 = 1
+                    while tj < tnlen {
+                        let tbj: u8 = buf[ti + tj]
+                        let tnj: u8 = needles[tnoff + tj]
+                        if tbj < tnj {
+                            tmatched = 0
+                            tj = tnlen
+                        } else {
+                            if tnj < tbj {
+                                tmatched = 0
+                                tj = tnlen
+                            }
+                        }
+                        tj = tj + 1
+                    }
+                    if tmatched == 1 {
+                        if mc < max_matches {
+                            matches[mc] = base_offset + ti
+                            needle_ids_out[mc] = tni
+                            mc = mc + 1
+                        }
+                    }
+                }
+            }
+            tni = tni + 1
+        }
+        ti = ti + 1
+    }
+
+    return mc
+}
+
+// Multi-needle overlap search: copies overlap + first max_needle_len-1 bytes
+// of new_buf into temp, then calls search_buf_multi on the temp buffer.
+func search_overlap_multi(
+    overlap_buf: *restrict mut u8, overlap_len: i32,
+    new_buf: *mut u8,
+    needles: *restrict u8, needle_offsets: *restrict i32,
+    needle_lens: *restrict i32, needle_count: i32,
+    max_needle_len: i32,
+    matches: *restrict mut i32, needle_ids_out: *restrict mut i32,
+    match_count: i32, max_matches: i32,
+    overlap_global_offset: i32,
+    temp: *restrict mut u8
+) -> i32 {
+    if overlap_len == 0 {
+        return match_count
+    }
+    // Copy overlap + first (max_needle_len - 1) bytes of new_buf into temp
+    let new_bytes: i32 = max_needle_len - 1
+    let mut ci: i32 = 0
+    while ci < overlap_len {
+        temp[ci] = overlap_buf[ci]
+        ci = ci + 1
+    }
+    let mut ni: i32 = 0
+    while ni < new_bytes {
+        temp[overlap_len + ni] = new_buf[ni]
+        ni = ni + 1
+    }
+    let temp_len: i32 = overlap_len + new_bytes
+    return search_buf_multi(temp, temp_len, needles, needle_offsets, needle_lens, needle_count,
+                            matches, needle_ids_out, match_count, max_matches, overlap_global_offset)
+}
+
+// ============================================================================
+// Context-line extraction helpers
+// ============================================================================
+
+// Find the start of the line containing position `pos` in buf.
+// Scans backward from pos-1 for \n using .== + movemask for fast-skip,
+// then scalar verify within chunks that have hits.
+// Returns position after \n, or scan_end if no \n found (truncated line start).
+func find_line_start(buf: *mut u8, pos: i32, max_scan: i32) -> i32 {
+    let nl_byte: u8 = 10
+    let newline_splat: u8x16 = splat(nl_byte)
+    let mut scan_end: i32 = pos - max_scan
+    if scan_end < 0 {
+        scan_end = 0
+    }
+
+    // Scalar scan from pos-1 down to the nearest 16-byte aligned position
+    let mut si: i32 = pos - 1
+    let aligned_start: i32 = (si / 16) * 16
+    while si >= aligned_start && si >= scan_end {
+        if !(buf[si] < nl_byte) && !(nl_byte < buf[si]) {
+            return si + 1
+        }
+        si = si - 1
+    }
+
+    // SIMD scan backward in 16-byte aligned chunks
+    let mut chunk_pos: i32 = aligned_start - 16
+    while chunk_pos >= scan_end {
+        let chunk: u8x16 = load(buf, chunk_pos)
+        let bits: i32 = movemask(chunk .== newline_splat)
+        if bits != 0 {
+            // Chunk has a \n — scalar scan backward from end of chunk
+            let mut ci: i32 = chunk_pos + 15
+            while ci >= chunk_pos && ci >= scan_end {
+                if !(buf[ci] < nl_byte) && !(nl_byte < buf[ci]) {
+                    return ci + 1
+                }
+                ci = ci - 1
+            }
+        }
+        chunk_pos = chunk_pos - 16
+    }
+
+    // Scalar scan for bytes between scan_end and last SIMD chunk
+    while si >= scan_end {
+        if !(buf[si] < nl_byte) && !(nl_byte < buf[si]) {
+            return si + 1
+        }
+        si = si - 1
+    }
+
+    return scan_end
+}
+
+// Find the end of the line containing position `pos` in buf.
+// Scans forward for \n. Returns position of \n,
+// or buf_len if no \n found (truncated line end).
+func find_line_end(buf: *mut u8, pos: i32, buf_len: i32, max_scan: i32) -> i32 {
+    let nl_byte: u8 = 10
+    let newline_splat: u8x16 = splat(nl_byte)
+    let scan_limit: i32 = pos + max_scan
+    let mut scan_pos: i32 = pos
+    // SIMD scan forward in 16-byte chunks
+    while scan_pos + 16 <= buf_len && scan_pos < scan_limit {
+        let chunk: u8x16 = load(buf, scan_pos)
+        let bits: i32 = movemask(chunk .== newline_splat)
+        if bits != 0 {
+            // Chunk has a \n — scalar scan forward from start of chunk
+            let mut ci: i32 = scan_pos
+            while ci < scan_pos + 16 {
+                if !(buf[ci] < nl_byte) && !(nl_byte < buf[ci]) {
+                    return ci
+                }
+                ci = ci + 1
+            }
+        }
+        scan_pos = scan_pos + 16
+    }
+    // Scalar scan for remaining bytes
+    let mut si: i32 = scan_pos
+    while si < buf_len && si < scan_limit {
+        if !(buf[si] < nl_byte) && !(nl_byte < buf[si]) {
+            return si
+        }
+        si = si + 1
+    }
+    return buf_len
+}
+
+// Extract the line around a match at `match_pos` in buf, copy to lines_buf.
+// Returns 1 if line was written, 0 if lines_buf is full.
+func extract_line(
+    buf: *mut u8, buf_len: i32, match_pos: i32,
+    max_line_len: i32,
+    lines_buf: *restrict mut u8, lines_buf_cap: i32, write_pos: i32,
+    line_offsets: *restrict mut i32, line_lens: *restrict mut i32,
+    line_idx: i32
+) -> i32 {
+    let ls: i32 = find_line_start(buf, match_pos, max_line_len)
+    let le: i32 = find_line_end(buf, match_pos, buf_len, max_line_len)
+    let mut line_len: i32 = le - ls
+    if line_len > max_line_len {
+        line_len = max_line_len
+    }
+    if write_pos + line_len > lines_buf_cap {
+        return 0
+    }
+    // Copy line bytes
+    let mut ci: i32 = 0
+    while ci < line_len {
+        lines_buf[write_pos + ci] = buf[ls + ci]
+        ci = ci + 1
+    }
+    line_offsets[line_idx] = write_pos
+    line_lens[line_idx] = line_len
+    return 1
+}
+
+// ============================================================================
+// Stub export — compiles the kernel; full implementation in Task 4
+// ============================================================================
+
+export func chacha20_search_v2(
+    key: *restrict i32, nonce: *restrict i32, ctr_init: i32,
+    ct_u8: *restrict u8, len: i32,
+    ks_i32: *restrict mut i32, ks_u8: *restrict mut u8,
+    ct_i32: *restrict i32,
+    pt_buf: *mut u8, pt_i32: *mut i32,
+    overlap: *restrict mut u8,
+    needles: *restrict u8, needle_offsets: *restrict i32,
+    needle_lens: *restrict i32, needle_count: i32,
+    lines_buf: *restrict mut u8, lines_buf_cap: i32,
+    line_offsets: *restrict mut i32, line_lens: *restrict mut i32,
+    match_offsets: *restrict mut i32, needle_ids: *restrict mut i32,
+    max_matches: i32, max_line_len: i32, window_size: i32,
+    match_count: *restrict mut i32, lines_written: *restrict mut i32
+) {
+    match_count[0] = 0
+    lines_written[0] = 0
+}

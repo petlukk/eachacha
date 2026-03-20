@@ -1,1 +1,47 @@
-[]
+[
+  {
+    "iteration": 1,
+    "hypothesis": "Remove Phase 6 (pt_buf zeroing per window) and the overlap exit zeroing. Since decrypt overwrites exactly `wsize` bytes before search reads them, zeroing is security theater that wastes ~30% of memory bandwidth. This should significantly improve throughput.",
+    "time_us": 29438.9,
+    "loc": 674,
+    "correct": true,
+    "accepted": true,
+    "kernel_hash": "3b114cc40a8a"
+  },
+  {
+    "iteration": 2,
+    "hypothesis": "Unroll the ChaCha20 round loops using `unroll(10)` to eliminate loop overhead and enable better instruction scheduling in the decrypt phase, which accounts for ~70% of execution time.",
+    "time_us": null,
+    "loc": null,
+    "correct": false,
+    "accepted": false,
+    "kernel_hash": "3b114cc40a8a"
+  },
+  {
+    "iteration": 3,
+    "hypothesis": "Replace 4-block ILP (256B) with 2-block ILP (128B) to reduce register pressure from 23+ to ~13 vector values, fitting within the 16 XMM register file and eliminating costly spills to memory in the critical decrypt loop (~70% of runtime).",
+    "time_us": 36572.3,
+    "loc": 612,
+    "correct": true,
+    "accepted": false,
+    "kernel_hash": "3b114cc40a8a"
+  },
+  {
+    "iteration": 4,
+    "hypothesis": "Manually inline all rotl16/rotl12/rotl8/rotl7 function calls in the 4-block ILP decrypt loop to eliminate function call overhead. With 320 rotl calls per 256B chunk (32 per double-round \u00d7 10 rounds), even 5 cycles of call/return overhead per invocation adds ~1600 cycles per chunk \u2014 matching the observed gap between 0.5 GB/s actual and ~1.4 GB/s theoretical. The Ea compiler at opt-level=3 may not inline these helper functions.",
+    "time_us": 30795.3,
+    "loc": 706,
+    "correct": true,
+    "accepted": false,
+    "kernel_hash": "3b114cc40a8a"
+  },
+  {
+    "iteration": 5,
+    "hypothesis": "TIMEOUT",
+    "time_us": null,
+    "loc": null,
+    "correct": false,
+    "accepted": false,
+    "kernel_hash": null
+  }
+]

@@ -43,9 +43,10 @@ All other pointer parameters can use `*restrict` or `*restrict mut` for alias op
 - `stream_store` for zeroing (avoids cache pollution)
 
 **Search optimizations:**
-- Current: `bits = bits + movemask(...)` for OR:ed bitmasks. Use `bits = bits | movemask(...)` instead (correct OR, may help branch prediction).
-- Use bitmask to skip non-candidate positions: `if (bits >> i) & 1 != 0` instead of checking all 16 positions
-- Process 2 chunks (32 bytes) at once with a single skip check
+- Current: `bits = bits + movemask(...)` for bitmask accumulation. This is correct for skip-or-verify (only checks `bits == 0`). Do NOT use `|` — it is not a valid Ea scalar operator.
+- Use the accumulated bitmask to skip entire chunks more aggressively
+- Process 2 chunks (32 bytes) at once: load two u8x16, check both bitmasks, skip 32 bytes if both zero
+- Reduce the number of needles checked per candidate by first-byte matching
 
 **Line extraction optimizations:**
 - Currently uses scalar fallback after SIMD detect. Could do pure SIMD for common case.
@@ -69,7 +70,9 @@ All other pointer parameters can use `*restrict` or `*restrict mut` for alias op
 - Math: `fma`, `sqrt`, `rsqrt`, `min`, `max`
 - Conversion: `widen_u8_i32x4`, `widen_u8_f32x4`, etc.
 
-**Scalar operators:** `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<<`, `>>`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `!`
+**Scalar operators:** `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `!`
+
+**NOT available on scalars:** `|` (bitwise OR), `&` (bitwise AND), `^` (XOR), `<<`, `>>` — these are VECTOR-ONLY via dot-operators (`.&`, `.|`, `.^`, `.<<`, `.>>`). The Ea lexer rejects `|` as an operator token. Use `+` for bitmask accumulation (safe when the only check is `bits == 0` vs `bits != 0`).
 
 **NOT available:** `popcount`, `ctz`, `clz`, structs, heap allocation, pointer arithmetic
 

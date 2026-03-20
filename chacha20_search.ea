@@ -147,7 +147,7 @@ export func chacha20_search(
     needle: *restrict u8, needle_len: i32,
     ks_i32: *restrict mut i32, ks_u8: *restrict mut u8,
     ct_i32: *restrict i32,
-    pt_buf: *restrict mut u8, pt_i32: *restrict mut i32,
+    pt_buf: *mut u8, pt_i32: *mut i32,
     overlap: *restrict mut u8,
     matches: *restrict mut i32, max_matches: i32,
     match_count: *restrict mut i32

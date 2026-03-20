@@ -18,18 +18,49 @@ Extends the searchable cipher with multi-needle search (multiple patterns in one
 | Multi-needle approach | All needles in one kernel call, one decrypt pass | Preserves fusion argument — decrypting N times defeats the purpose |
 | Needle input format | Packed array + offset/length tables | Ea can't do structs; parallel arrays match v1 pattern |
 | SIMD filtering | OR:ed bitmasks from `.==` + `movemask` per unique first-byte | Linear in unique first-bytes, not total needles |
-| Context extraction | Kernel finds \n boundaries, copies line to packed output buffer | Plaintext already in pt_buf — \n search is near-free with same `.==` + `movemask` |
-| Truncated lines | No flags parameter — Python infers from line_offsets vs match context | Simpler; lines at pt_buf boundary shown with `...` prefix/suffix |
-| Line length limit | Configurable `max_line_len` parameter, default 1 KB | Covers >99% of log lines; JSON logs can increase to 4 KB |
-| Output format | Packed buffer + parallel arrays (offset, len, match_offset, needle_id) | Memory-efficient for variable-length lines |
+| Decryption window | 4 KB configurable (`window_size` param, default 4096) | 256-byte pt_buf too small for line extraction (~80-200 byte log lines). 4 KB covers ~20-50 lines. |
+| Context extraction | Kernel finds \n boundaries within decrypt window, copies line to packed output buffer | Plaintext in decrypt window — \n search is near-free with `.==` + `movemask` |
+| Truncated lines | No flags parameter — Python infers from line content | Lines at window boundary shown with `...` prefix/suffix by Python |
+| Line length limit | Configurable `max_line_len` parameter, default 1 KB | Covers >99% of log lines; limits both copy AND scan distance |
+| Duplicate lines | Emitted per match (no dedup in kernel) | Simpler; Python-side dedup trivial via match_offsets |
+| Output format | Packed buffer + parallel arrays (offset, len, match_offset, needle_id) + lines_written count | Memory-efficient for variable-length lines |
 | Benchmark dataset | NASA HTTP access logs (July 1995, ~200 MB) | Well-known, free, realistic log search patterns |
 | v1 kernel | Unchanged — v2 is a new file | No regression risk |
+| Max needles | 64 | Enforced by early-return in kernel |
+| lines_buf zeroing | Caller's responsibility (it's an output buffer they intentionally read) | Kernel zeroes pt_buf (internal); lines_buf is external output |
 
 ## Kernel Architecture
 
 ### New file: `chacha20_search_v2.ea`
 
-### Signature (22 parameters)
+### Decryption Window Architecture
+
+v1 used a 256-byte `pt_buf` — too small for line extraction. v2 decrypts into a larger window (default 4 KB) before searching. The 3-tier decrypt logic fills this window:
+
+```
+while bytes_remaining > 0:
+    // Phase 1: Fill decrypt window (4 KB or remaining bytes, whichever is smaller)
+    fill_offset = 0
+    while fill_offset + 256 <= window_fill_target:
+        // 4-block ILP decrypt → store to pt_buf[fill_offset..fill_offset+256]
+        fill_offset += 256
+    while fill_offset + 64 <= window_fill_target:
+        // single-block decrypt → store to pt_buf[fill_offset..fill_offset+64]
+        fill_offset += 64
+    if fill_offset < window_fill_target:
+        // sub-block tail → store to pt_buf[fill_offset..fill_offset+remaining]
+
+    // Phase 2: Search overlap region (from previous window)
+    // Phase 3: Multi-needle SIMD search of pt_buf[0..fill_offset]
+    // Phase 4: Extract context lines for matches found
+    // Phase 5: Save overlap, zero pt_buf
+```
+
+This means `pt_buf` must be at least `window_size` bytes (caller-allocated, default 4096). The `pt_i32` alias covers the same buffer. Tier 1/2/3 ILP decrypt logic is identical to v1 — the only change is that multiple decrypt iterations fill a larger buffer before searching.
+
+**Security:** The window is zeroed after each search phase. Max plaintext in memory: `window_size` bytes (4 KB default) vs v1's 256 bytes. Still a 25-million-fold reduction vs full-file decryption for a 100 GB file.
+
+### Signature (24 parameters)
 
 ```
 export func chacha20_search_v2(
@@ -55,88 +86,121 @@ export func chacha20_search_v2(
     match_offsets: *restrict mut i32, // global byte offset of match
     needle_ids: *restrict mut i32,   // which needle matched (0-indexed)
     max_matches: i32,
-    max_line_len: i32,               // max bytes per line (default 1024)
-    match_count: *restrict mut i32
+    max_line_len: i32,               // max bytes per line (default 1024), limits scan + copy
+    window_size: i32,                // decrypt window size (default 4096, min 256)
+    match_count: *restrict mut i32,  // output: total matches found
+    lines_written: *restrict mut i32 // output: actual lines written to lines_buf (may be < match_count)
 )
 ```
 
 Note: `pt_buf`/`pt_i32` must NOT use `*restrict` (they alias — v1 lesson).
 
-### Three-Tier Processing
-
-Same 3-tier structure as v1: 4-block ILP (256B) → single-block (64B) → sub-block tail. The decrypt logic is identical. Only the search + output phase changes.
+**Early exits:** `needle_count <= 0`, `needle_count > 64`, `len <= 0` → set `match_count[0] = 0`, `lines_written[0] = 0`, return.
 
 ### Multi-Needle SIMD Filtering
 
 **Init phase (before main loop):**
 
-Extract unique first-bytes from all needles. Max 64 needles supported.
+Extract unique first-bytes from all needles into a fixed-size array. Ea data layout:
 
+```ea
+// Fixed arrays (stack-allocated, max 64 needles)
+let mut unique_fb: *mut u8 = ...        // unique first-bytes, up to 64
+let mut unique_count: i32 = 0
+let mut fb_to_needles: *mut i32 = ...   // for each unique_fb[i], packed list of needle indices
+
+// Dedup loop: O(n^2) for n <= 64, negligible
+for ni in 0..needle_count:
+    let fb = needles[needle_offsets[ni]]
+    // check if fb already in unique_fb[0..unique_count]
+    // if not: add it, map it to needle ni
+    // if yes: append needle ni to existing mapping
 ```
-unique_first_bytes[]: deduplicated first bytes of all needles
-unique_count: number of unique first bytes
-// For verify: map first_byte → list of needle indices with that first byte
-```
+
+Since Ea has no dynamic arrays, the mapping uses a flat 2D layout:
+- `fb_needle_map[i * 64 + j]` = j-th needle index for unique_fb[i]
+- `fb_needle_count[i]` = number of needles for unique_fb[i]
+
+Max memory: 64 * 64 * 4 = 16 KB for the map. Allocated by caller or as scratch buffer parameter.
 
 **Per u8x16 chunk:**
 
-```
-bits = 0
-for each unique first byte fb:
-    bits = bits | movemask(chunk .== splat(fb))
-if bits == 0:
-    skip chunk
-else:
-    scalar scan positions where bits are set
-    for each candidate position:
-        test all needles with matching first byte
-        on match: extract context line, write to output
+```ea
+let mut bits: i32 = 0
+let mut fi: i32 = 0
+while fi < unique_count {
+    bits = bits | movemask(chunk .== splat(unique_fb[fi]))
+    fi = fi + 1
+}
+if bits == 0 {
+    skip chunk  // no first-byte from any needle
+} else {
+    // scalar scan positions where bits are set
+    // at each candidate: test all needles whose first byte matches buf[pos]
+    // on match: record match, extract context line
+}
 ```
 
-Cost: one `vpcmpeqb` + `vpmovmskb` + OR per unique first-byte per chunk. For 3 needles with unique first-bytes: 3 comparisons + 2 ORs per chunk.
+**Verify at candidate position:** When `buf[pos]` matches a first-byte, iterate only the needles that share that first-byte (via `fb_needle_map`), not all needles. Full byte-by-byte verify for each candidate needle.
 
 ### Context Line Extraction
 
-When a match is found at position `p` in `pt_buf`:
+When a match is found at position `p` in `pt_buf` (which is now the large decrypt window):
 
 **Find line_start (backward \n search):**
 
-```
+```ea
 newline_splat = splat(10)  // '\n'
-// Scan backward from p in 16-byte chunks
-// movemask(chunk .== newline_splat) → find highest set bit
-// If no \n found before pt_buf start: line_start = 0 (truncated)
+// Scan backward from p, max max_line_len bytes
+// movemask(load(pt_buf, scan_pos) .== newline_splat) → find highest set bit
+// Stop at: \n found, pt_buf start reached, or max_line_len distance
+// line_start = position after \n (or 0 if no \n found = truncated start)
 ```
 
 **Find line_end (forward \n search):**
 
+```ea
+// Scan forward from p + needle_len, max max_line_len bytes
+// movemask(load(pt_buf, scan_pos) .== newline_splat) → find lowest set bit
+// Stop at: \n found, pt_buf end reached, or max_line_len distance
+// line_end = position of \n (or buf_len if no \n found = truncated end)
 ```
-// Scan forward from p + needle_len in 16-byte chunks
-// movemask(chunk .== newline_splat) → find lowest set bit
-// If no \n found before pt_buf end: line_end = current_buf_len (truncated)
-```
+
+**max_line_len limits both scan distance AND copy length.** No unbounded scans.
 
 **Copy line to output:**
 
-```
+```ea
 line_len = min(line_end - line_start, max_line_len)
-copy pt_buf[line_start..line_start+line_len] → lines_buf[write_pos]
-line_offsets[match_idx] = write_pos
-line_lens[match_idx] = line_len
-match_offsets[match_idx] = global_offset + p
-needle_ids[match_idx] = matched_needle_index
-write_pos += line_len
+if write_pos + line_len <= lines_buf_cap {
+    copy pt_buf[line_start..line_start+line_len] → lines_buf[write_pos]
+    line_offsets[lines_written] = write_pos
+    line_lens[lines_written] = line_len
+    needle_ids[lines_written] = matched_needle_index
+    write_pos += line_len
+    lines_written += 1
+}
+match_offsets[match_count] = global_offset + p
+match_count += 1
 ```
 
-**Overflow protection:** If `write_pos + line_len > lines_buf_cap`, stop recording lines (but continue counting matches). `match_count` reflects total matches; actual lines in buffer may be fewer.
+**lines_written vs match_count:** `match_count` always increments (total matches). `lines_written` only increments when the line fits in `lines_buf`. Python can iterate `line_offsets[0..lines_written]` safely.
 
-**Truncated lines:** Lines that start at pt_buf position 0 or end at pt_buf boundary are likely truncated (the real \n is in the previous/next iteration). Python can detect this by checking if the line starts/ends with \n. No kernel-side flags needed.
+**Duplicate lines:** If two needles match on the same line, the line is emitted twice. Python deduplicates if needed.
 
 ### Overlap Handling
 
-Same as v1: `needle_len - 1` bytes carried between iterations. For multi-needle, use `max(needle_lens[0..needle_count]) - 1` as the overlap size.
+**Overlap size:** `max(needle_lens[0..needle_count]) - 1`. Kernel computes this at init by scanning `needle_lens`. The overlap buffer must be allocated by Python to at least 63 bytes (max needle is 64 bytes → overlap 63). Python should allocate 64 bytes to be safe (same as v1).
 
-The overlap is for needle matching only, not for line extraction. Lines that cross iteration boundaries will be truncated, which is acceptable — Python shows `...` prefix/suffix.
+**Multi-needle overlap search:** The overlap region is searched against ALL needles, not just one. The `search_overlap` function from v1 is adapted to `search_overlap_multi` which loops over all needles for each candidate position in the overlap buffer. Context-line extraction is NOT performed for overlap matches (the overlap buffer is too small). These matches get `match_offsets` but empty lines (`line_lens = 0`). Python can do a targeted decrypt for these rare cases.
+
+### Overlap matches and line extraction
+
+Overlap matches (needle straddling two windows) are rare and their context line spans two windows. For these matches:
+- `match_offsets[i]` is set correctly
+- `line_lens[i]` is set to 0 (no line extracted)
+- `needle_ids[i]` is set correctly
+- Python can detect `line_lens[i] == 0` and do a targeted decrypt if needed
 
 ## Python Bindings & CLI
 
@@ -146,7 +210,7 @@ Built by `ea bind chacha20_search_v2.ea --python`.
 
 ### Updated CLI: `eachacha_grep.py`
 
-Add `--multi` mode or accept multiple needles:
+Accept multiple needle arguments:
 
 ```bash
 python3 eachacha_grep.py "404" "500" "302" encrypted_nasa.bin \
@@ -163,40 +227,57 @@ Found 15832 matches in 204,928,317 bytes (3 patterns)
 
 When single needle is given, falls back to v1 kernel (simpler, slightly faster).
 
+### NASA log download
+
+Script `data/download_nasa.sh`:
+
+```bash
+#!/bin/bash
+mkdir -p data
+curl -L -o data/nasa_jul95.log.gz \
+    "https://ita.ee.lbl.gov/traces/NASA_access_log_Jul95.gz" \
+    || curl -L -o data/nasa_jul95.log.gz \
+    "ftp://ita.ee.lbl.gov/traces/NASA_access_log_Jul95.gz"
+gunzip -k data/nasa_jul95.log.gz
+echo "Downloaded $(wc -c < data/nasa_jul95.log) bytes"
+```
+
 ## Test Suite
 
 ### New file: `test_search_v2.py`
 
 **Regression tests (v1 equivalents adapted to v2 signature):**
-1-9. Same correctness tests as v1 but calling v2 with single needle — verify identical results
+1-9. Same correctness tests as v1 but calling v2 with single needle — verify identical match offsets
 
 **Multi-needle tests:**
 10. Two needles, separate locations — both found with correct needle_id
-11. Three needles, some overlapping first-bytes ("ERROR", "EXIT") — verify dedup works
+11. Three needles, overlapping first-bytes ("ERROR", "EXIT") — verify dedup works, both found
 12. Five needles, dense matches — verify all found
-13. Needle not present in multi-set — zero matches for that needle_id
-14. All needles match at same position (e.g., "AB" and "ABC" at same offset) — both reported
+13. Needle not present in multi-set — zero matches for that needle_id, others found
+14. Two needles match at same position ("AB" and "ABC" at same offset) — both reported, scan does not skip past
 
 **Context line tests:**
 15. Match mid-line — verify \n boundaries correct, full line extracted
 16. Match at line start — verify line_start is after previous \n
-17. Match at line end — verify line_end is at \n
-18. Multiple matches on same line — line extracted once per match (or deduplicated?)
+17. Match at line end (just before \n) — verify line_end is at \n
+18. Multiple matches on same line — line emitted per match (duplicates expected)
 19. Line longer than max_line_len — truncated to max_line_len
-20. Match near pt_buf boundary — truncated line, no crash
+20. Match near window boundary — truncated line (no crash), line starts/ends at window edge
 
 **Cross-verification:**
-21. Random data with injected needles, decrypt + Python search as reference
-22. NASA log subset (1 KB) — encrypt, search, verify against plaintext grep
+21. Random data with injected needles, decrypt + Python search as reference — verify all match offsets
+22. NASA log subset (1 KB) — encrypt, multi-needle search, verify against plaintext
 
 **Edge cases:**
-23. lines_buf overflow — more matches than buffer capacity
+23. lines_buf overflow — lines_written < match_count, no crash, match_count correct
 24. Zero needles (needle_count=0) — return 0 matches
-25. needle_count=1 — behaves identically to v1
+25. needle_count=1 — match offsets identical to v1
+26. needle_count=65 — early return, 0 matches
+27. Overlap match — line_lens[i] == 0, match_offsets correct
 
 ## Benchmark Suite
 
-### Updated: `bench_search.py` or new `bench_search_v2.py`
+### New file: `bench_search_v2.py`
 
 **Synthetic benchmarks (64 MB):**
 
@@ -216,9 +297,9 @@ When single needle is given, falls back to v1 kernel (simpler, slightly faster).
 | 7 | grep on plaintext NASA log | `grep -c "404\|500\|302"` |
 
 **Target headlines:**
-- v2 multi-needle vs v1 x3 → fusion speedup (should be ~2-3x)
+- v2 multi-needle vs v1 x3 → fusion speedup (should be ~2-3x for 3 needles)
 - v2 on encrypted NASA log vs grep on plaintext NASA log → the "wow" number
-- Context line overhead vs match-only (v1) → cost of line extraction
+- Context line overhead vs match-only (v1 single needle, no lines) → cost of line extraction
 
 ## New Files
 
@@ -226,9 +307,9 @@ When single needle is given, falls back to v1 kernel (simpler, slightly faster).
 |------|---------|
 | `chacha20_search_v2.ea` | Multi-needle decrypt+search+context kernel |
 | `chacha20_search_v2.py` | Auto-generated Python bindings |
-| `test_search_v2.py` | v2 test suite (25 tests) |
+| `test_search_v2.py` | v2 test suite (27 tests) |
 | `bench_search_v2.py` | v2 benchmark suite (NASA + synthetic) |
-| `data/nasa_jul95.log.gz` | NASA HTTP access log (downloaded, compressed) |
+| `data/download_nasa.sh` | NASA log download script |
 
 ## Modified Files
 

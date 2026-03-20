@@ -3,6 +3,6 @@
 from .search import search
 from .encrypt import encrypt, decrypt
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 __all__ = ["encrypt", "decrypt", "search"]

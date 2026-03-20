@@ -4,13 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eachacha"
-version = "1.0.1"
+version = "1.0.2"
 description = "ChaCha20 SIMD kernels in Eä — encrypt, fused stats, and searchable cipher"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [{name = "Peter Lukka", email = "peter.lukka@gmail.com"}]
 dependencies = ["numpy>=1.21"]
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+]
 
 [project.scripts]
 eachacha-grep = "eachacha.cli:main"

@@ -140,7 +140,8 @@ func search_overlap(
     return search_buf(temp, temp_len, needle, needle_len, matches, match_count, max_matches, overlap_global_offset)
 }
 
-// SIMD-accelerated search: XOR + reduce_min to skip chunks without first-byte match.
+// SIMD-accelerated search: .== + movemask for first-byte filtering.
+// Same algorithm as glibc memmem / GNU grep: vpcmpeqb + vpmovmskb.
 func search_buf_simd(
     buf: *mut u8, buf_len: i32,
     needle: *restrict u8, needle_len: i32,
@@ -150,30 +151,26 @@ func search_buf_simd(
     let mut mc: i32 = match_count
     let first_byte: u8 = needle[0]
     let first_splat: u8x16 = splat(first_byte)
-    let zero_splat: u8x16 = first_splat .^ first_splat
-    let zero_byte: u8 = reduce_min(zero_splat)
     let mut chunk_off: i32 = 0
 
-    // Process full 16-byte chunks with SIMD fast-skip
+    // Process full 16-byte chunks with SIMD first-byte filter
     while chunk_off + 16 <= buf_len {
         if mc >= max_matches {
             return mc
         }
         let chunk: u8x16 = load(buf, chunk_off)
-        let xored: u8x16 = chunk .^ first_splat
-        let rmin: u8 = reduce_min(xored)
-        if rmin > zero_byte {
+        let bits: i32 = movemask(chunk .== first_splat)
+        if bits == 0 {
             // No byte in this chunk matches first byte — skip entire chunk
             chunk_off = chunk_off + 16
         } else {
-            // Potential match — scalar scan this 16-byte region
+            // Has candidates — scalar scan positions where bits are set
             let scan_end: i32 = chunk_off + 16
             let mut i: i32 = chunk_off
             while i < scan_end {
                 if mc >= max_matches {
                     return mc
                 }
-                // Use !(a < b) && !(b < a) for u8 equality (Ea has no == on u8)
                 if !(buf[i] < first_byte) && !(first_byte < buf[i]) {
                     let mut j: i32 = 1
                     let mut matched: i32 = 1

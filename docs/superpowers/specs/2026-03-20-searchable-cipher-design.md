@@ -6,28 +6,52 @@
 
 ## Summary
 
-A fused ChaCha20-Decrypt + String-Match kernel that searches encrypted data without ever writing plaintext to RAM. Decrypted bytes live and die in CPU registers — no `store` instruction for plaintext.
+A fused ChaCha20-Decrypt + String-Match kernel that searches encrypted data in a single streaming pass. Plaintext exists only in a small 256-byte working buffer (hot in L1 cache), never as a full-file allocation. The buffer is zeroed after each iteration.
 
 **Pitch:** "I can search my encrypted database faster than Linux grep can search plaintext."
 
-**Scenario:** 100 GB encrypted log data. The normal way: decrypt all to RAM, then grep. The Ea way: decrypt in registers, search in registers, discard. Zero plaintext exposure.
+**Scenario:** 100 GB encrypted log data. The normal way: decrypt all to RAM/disk, then grep (two passes, full plaintext exposure). The Ea way: stream-decrypt 256 bytes at a time, search, discard. Single pass, bounded plaintext exposure (256 bytes + 63-byte overlap, zeroed per iteration).
+
+## Security Model
+
+**What we guarantee:**
+- No full-file plaintext buffer — only 256 bytes live at any time
+- Working buffer zeroed after each iteration
+- Plaintext never written to disk
+- Only match offsets leave the kernel — no plaintext in output
+
+**What we don't claim:**
+- "Zero plaintext in RAM" — the 256-byte working buffer and 63-byte overlap buffer are in RAM (L1 cache). This is an inherent constraint of Ea's current type system: no bitcast between i32x4 and u8x16, so decrypted i32x4 must be stored and reloaded as u8x16 for byte-level search. This matches the pattern used by the existing `chacha20_fused.ea` stats kernel.
+
+**Why this is still compelling:** The alternative (decrypt-then-grep) materializes the *entire file* as plaintext. 256 bytes vs 100 GB is a 400-million-fold reduction in exposure surface.
 
 ## Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Demo scenario | Log search (fixed strings like "ERROR") | Most relatable real-world use case |
-| Match output | Block index + byte offset only | Keeps kernel simple; caller handles presentation |
+| Match output | Absolute byte offset only | Keeps kernel simple; caller handles presentation |
 | Pattern type | Single fixed string per call | Sufficient for "faster than grep" benchmark; multi-string is v2 |
 | Boundary handling | Overlap buffer (needle_len - 1 bytes between iterations) | Correct solution; tiny cost; no missed matches |
-| Search algorithm | SIMD first-byte filter + scalar verify | Same algorithm class as glibc memmem / GNU grep; genuinely SIMD-accelerated search |
+| Search algorithm | XOR + reduce_min fast-skip, scalar verify | Best algorithm achievable with Ea's current primitives (no cmpeq on u8x16) |
 | Benchmark suite | Full matrix: fused vs decrypt-then-grep vs plaintext grep, 64KB-256MB | Proves consistent scaling, matches existing bench.py rigor |
+| Overlapping matches | Reported (resume from p+1, not p+needle_len) | Correct grep-like semantics |
+
+## Ea Primitive Constraints
+
+The search algorithm is shaped by what Ea currently supports on u8x16:
+
+**Available:** `load`, `load_masked`, `store`, `store_masked`, `shuffle`, `splat`, `.^` (XOR), `.&` (AND), `reduce_min`, `reduce_max`, `reduce_add`, `widen_u8_i32x4`
+
+**Not available:** `cmpeq` (byte comparison → mask), `bitcast` (i32x4 ↔ u8x16), byte extraction by index from u8x16
+
+This means we cannot do a true SIMD first-byte filter with bitmask extraction. Instead, we use XOR + reduce_min as a fast-skip heuristic, with scalar verify as the workhorse.
 
 ## Kernel Architecture
 
 ### New file: `chacha20_search.ea`
 
-Fuses ChaCha20 decryption with SIMD string search in a single pass. Structure mirrors `chacha20_fused.ea` but replaces stats accumulation with search logic.
+Fuses ChaCha20 decryption with streaming string search. Structure mirrors `chacha20_fused.ea`: same 4-block ILP decrypt, but replaces stats accumulation with search logic operating on a 256-byte working buffer.
 
 ### Signature
 
@@ -43,63 +67,81 @@ chacha20_search(
     ks_i32: *restrict i32,       // keystream buffer (4-block = 256 bytes)
     ks_u8: *restrict u8,         // alias of ks_i32
     ct_i32: *restrict i32,       // i32 alias of ciphertext
+    pt_buf: *restrict u8,        // 256-byte plaintext working buffer (caller-allocated)
+    pt_i32: *restrict i32,       // i32 alias of pt_buf
+    overlap: *restrict u8,       // 64-byte overlap buffer (caller-allocated)
     matches: *restrict i32,      // output: array of match offsets
-    match_count: *restrict i32   // output: number of matches found
+    max_matches: i32,            // capacity of matches array
+    match_count: *restrict i32   // output: number of matches found (initialized by kernel)
 )
 ```
 
-No plaintext pointer. Decrypted bytes exist only in registers, never stored to RAM. This is the security property.
+### Three-Tier Processing (matches existing kernels)
 
-### Hot Loop (4-block, 256 bytes per iteration)
+**Tier 1: 4-block hot loop (256 bytes per iteration)**
+1. Decrypt 4 blocks via i32x4 ILP XOR → store to `pt_i32` (same as fused kernel stores to ct_i32)
+2. Search the overlap buffer: scan `overlap[0..needle_len-2]` + first `needle_len-1` bytes of `pt_buf` for boundary-spanning matches (scalar, at most 63+63 = 126 bytes, skipped on first iteration)
+3. Search `pt_buf[0..255]` using XOR + reduce_min fast-skip per u8x16 chunk, scalar verify on candidates
+4. Save last `needle_len - 1` bytes of `pt_buf` into `overlap`
+5. Zero `pt_buf` (security hygiene)
 
-1. Decrypt 4 blocks into i32x4 registers (same ILP pattern as `chacha20.ea`)
-2. Reinterpret decrypted i32x4 as u8x16 chunks (16 chunks per 4-block iteration)
-3. For each u8x16 chunk: `cmpeq` against `needle[0]`, extract bitmask
-4. For each set bit: verify remaining `needle[1..needle_len]` bytes against decrypted data in registers
-5. On match: write `global_offset` to `matches[*match_count]`, increment `match_count`
-6. Before moving to next iteration: save last `needle_len - 1` decrypted bytes into overlap buffer for boundary matching
+**Tier 2: Single-block loop (64 bytes)**
+Same pattern for remaining full blocks after the 4-block loop exhausts.
+
+**Tier 3: Sub-block tail (< 64 bytes)**
+Generate keystream via `chacha20_block()` into `ks_i32`, XOR with ciphertext byte-by-byte, search the partial block. Handle overlap from previous tier.
 
 ### Search Algorithm
 
-**First-byte filter:**
-
-For each decrypted u8x16 chunk, broadcast `needle[0]` to all 16 lanes and compare:
+**Fast-skip (per u8x16 chunk):**
 
 ```
-needle_first = broadcast_u8x16(needle[0])
-mask = cmpeq_u8x16(chunk, needle_first)
+xored: u8x16 = load(pt_buf, offset) .^ splat(needle[0])
+if reduce_min(xored) != 0:
+    skip  // no byte in this chunk matches needle[0]
 ```
 
-Produces a bitmask of candidate positions. ~1 in 256 bytes match the first byte on random data, so most chunks hit the fast path (cmpeq + branch-on-zero).
+When `reduce_min` is nonzero, no byte equals `needle[0]` — skip the entire 16-byte chunk. For random data with a specific first byte, ~93.5% of chunks are skipped (1 - (1 - 1/256)^16 ≈ 6.1% hit rate).
 
-**Verify path:**
+**Scalar verify (when chunk has candidates):**
 
-When a candidate is found at position `p`, verify `needle[1..needle_len]` byte-by-byte against the decrypted data still in registers. For matches near chunk boundaries, index into the next chunk's register.
-
-**Overlap buffer:**
-
-Between iterations, hold `needle_len - 1` bytes from the end of the previous iteration:
-
+When a chunk cannot be skipped, scan it byte-by-byte:
 ```
-overlap[0..needle_len-2] = last (needle_len-1) bytes of previous iteration
+for i in 0..16:
+    if pt_buf[offset + i] == needle[0]:
+        // verify needle[1..needle_len] at offset+i+1
+        // on full match: write offset to matches array
 ```
 
-At the start of each new 256-byte iteration, scan the overlap concatenated with the first bytes of the new decrypted data. Scalar scan over at most 63 bytes — negligible cost.
+This is simple and correct. The fast-skip ensures the scalar path is rarely taken.
+
+**Overlap handling:**
+
+```
+overlap[0..needle_len-2]  // last bytes from previous iteration
+```
+
+At the start of each iteration (except the first), concatenate `overlap` with the first `needle_len - 1` bytes of the new `pt_buf` and scan this `2*(needle_len-1)` byte region for matches. Scalar scan, at most 126 bytes — negligible cost.
+
+The overlap buffer is initialized empty (length 0). On the first iteration, the overlap scan is skipped.
 
 **Match output:**
 
 ```
-matches[*match_count] = block_start_offset + chunk_index * 16 + position_in_chunk
-*match_count += 1
+if *match_count < max_matches:
+    matches[*match_count] = global_byte_offset
+    *match_count += 1
 ```
 
-**Needle length constraint:** v1 supports 1-64 bytes. Covers any realistic grep-style fixed string.
+Kernel initializes `*match_count = 0` on entry. The `max_matches` parameter prevents buffer overflow.
+
+**Needle length constraint:** v1 supports 1-64 bytes (one ChaCha20 block). Covers any realistic grep-style fixed string.
 
 ## Python Bindings & CLI
 
 ### Auto-generated: `chacha20_search.py`
 
-Built by `ea bind chacha20_search.ea --python`. Wraps ctypes call with numpy array allocation.
+Built by `ea bind chacha20_search.ea --python`. Wraps ctypes call with numpy array allocation for `pt_buf`, `overlap`, `matches`, and `match_count`.
 
 ### CLI wrapper: `eachacha_grep.py`
 
@@ -109,13 +151,20 @@ python3 eachacha_grep.py "ERROR" encrypted_logs.bin --key <hex> --nonce <hex>
 
 Workflow:
 1. mmap the ciphertext file
-2. Allocate matches array (pre-sized, e.g., 1M entries)
+2. Allocate matches array (pre-sized, e.g., 1M entries — 4MB)
 3. Call `chacha20_search()`
 4. Print match offsets
 
-Optional context-line feature: targeted second-pass decrypt of ~80 bytes around each match using existing `chacha20_encrypt()`. Only matched regions decrypted to user-visible memory.
+Optional: targeted second-pass decrypt of ±80 bytes around each match using existing `chacha20_encrypt()` to show context lines. Only matched regions decrypted to user-visible memory.
 
-No changes to existing files. The new kernel is purely additive.
+### Build script update
+
+Add to `build.sh`:
+```bash
+echo "Building chacha20_search.ea..."
+$EA chacha20_search.ea --lib --opt-level=3
+$EA bind chacha20_search.ea --python
+```
 
 ## Test Suite
 
@@ -130,13 +179,19 @@ No changes to existing files. The new kernel is purely additive.
 6. Cross-iteration boundary match (needle straddling bytes 254-258)
 7. Single-byte needle
 8. Needle length == 64 (maximum)
+9. Overlapping matches: "aa" in "aaaa" → matches at 0, 1, 2
 
 **Cross-verification tests:**
-9. Decrypt with `chacha20_encrypt()`, `str.find()` on plaintext, compare offsets — random data, multiple sizes
-10. Same with realistic log-like data ("ERROR" scattered at random positions)
+10. Decrypt with `chacha20_encrypt()`, find all occurrences via Python `str.find()` loop, compare offsets — random data, multiple sizes
+11. Same with realistic log-like data ("ERROR" scattered at random positions)
 
 **Size sweep:**
-11. Sizes: 0, 1, 15, 16, 63, 64, 65, 127, 128, 255, 256, 257, 1000, 4096, 1MB
+12. Sizes: 0, 1, 15, 16, 63, 64, 65, 127, 128, 255, 256, 257, 1000, 4096, 1MB
+
+**Edge cases:**
+13. matches array too small (max_matches < actual matches) — verify no overflow, match_count == max_matches
+14. Empty needle (needle_len == 0) — return 0 matches
+15. First iteration overlap skip — no false matches from uninitialized overlap
 
 Follows existing test style: pytest, numpy, ctypes.
 
@@ -148,21 +203,21 @@ Throughput (GB/s) across 64KB → 256MB.
 
 | # | Implementation | What it measures |
 |---|----------------|-----------------|
-| 1 | Ea fused decrypt+search | The new kernel — single pass, zero plaintext in RAM |
-| 2 | Ea decrypt → Python memmem | Two-pass: `chacha20_encrypt()` to buffer, then `plaintext.find()` |
+| 1 | Ea fused decrypt+search | The new kernel — single pass, bounded plaintext |
+| 2 | Ea decrypt → Python find | Two-pass: `chacha20_encrypt()` to buffer, then `bytes.find()` |
 | 3 | Ea decrypt → C memmem | Two-pass: decrypt to buffer, then libc `memmem()` via ctypes |
-| 4 | grep on plaintext file | Pre-decrypted file on disk, `subprocess.run(["grep"])` |
-| 5 | grep on plaintext in-memory | `memmem` via ctypes on plaintext numpy buffer |
+| 4 | grep on plaintext file | Pre-decrypted file on disk, `subprocess.run(["grep", "-c"])`. Only meaningful at large sizes (includes process overhead). |
+| 5 | C memmem on plaintext in-memory | `memmem` via ctypes on plaintext numpy buffer. Pure search speed baseline. |
 
 **Test data (v1):** Random bytes with "ERROR" injected at ~1 per 4KB (realistic log density). Same data encrypted for benchmarks 1-3, plaintext for 4-5.
 
-**v2 data:** Real public log dataset (e.g., public access logs, HTTP traffic corpus) for more credible benchmarks.
+**v2 data:** Real public log dataset (public access logs, HTTP traffic corpus, etc.) for more credible real-world benchmarks.
 
 **Output:** Median GB/s, stddev, table across all sizes. Same format as existing `bench.py`.
 
 **Target headlines:**
 - Fused vs two-pass → fusion speedup ratio
-- Fused on encrypted vs grep on plaintext → the "wow" number
+- Fused on encrypted vs grep/memmem on plaintext → the "wow" number
 - Consistent scaling across sizes → credibility
 
 ## New Files
@@ -172,8 +227,14 @@ Throughput (GB/s) across 64KB → 256MB.
 | `chacha20_search.ea` | Fused decrypt+search kernel |
 | `chacha20_search.py` | Auto-generated Python bindings |
 | `eachacha_grep.py` | CLI demo wrapper |
-| `test_search.py` | Test suite |
+| `test_search.py` | Test suite (15+ tests) |
 | `bench_search.py` | Benchmark suite |
+
+## Modified Files
+
+| File | Change |
+|------|--------|
+| `build.sh` | Add chacha20_search.ea build + bind lines |
 
 ## v2 Roadmap (out of scope for v1)
 
@@ -182,3 +243,4 @@ Throughput (GB/s) across 64KB → 256MB.
 - Context-line extraction in kernel (find \n boundaries, copy matched line)
 - Real public log dataset for benchmarks
 - Parallel multi-core search (ThreadPoolExecutor, split file into chunks)
+- If Ea adds `cmpeq` on u8x16: true SIMD first-byte filter with bitmask (replaces XOR+reduce_min heuristic)

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eachacha"
+version = "1.0.0"
+description = "ChaCha20 SIMD kernels in Eä — encrypt, fused stats, and searchable cipher"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "Peter Lukka", email = "peter.lukka@gmail.com"}]
+dependencies = ["numpy>=1.21"]
+
+[project.scripts]
+eachacha-grep = "eachacha.cli:main"
+
+[project.urls]
+Repository = "https://github.com/petlukk/eachacha"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+eachacha = ["lib/*.so"]

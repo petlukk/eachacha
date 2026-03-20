@@ -140,6 +140,104 @@ func search_overlap(
     return search_buf(temp, temp_len, needle, needle_len, matches, match_count, max_matches, overlap_global_offset)
 }
 
+// SIMD-accelerated search: XOR + reduce_min to skip chunks without first-byte match.
+func search_buf_simd(
+    buf: *mut u8, buf_len: i32,
+    needle: *restrict u8, needle_len: i32,
+    matches: *restrict mut i32, match_count: i32, max_matches: i32,
+    base_offset: i32
+) -> i32 {
+    let mut mc: i32 = match_count
+    let first_byte: u8 = needle[0]
+    let first_splat: u8x16 = splat(first_byte)
+    let zero_splat: u8x16 = first_splat .^ first_splat
+    let zero_byte: u8 = reduce_min(zero_splat)
+    let mut chunk_off: i32 = 0
+
+    // Process full 16-byte chunks with SIMD fast-skip
+    while chunk_off + 16 <= buf_len {
+        if mc >= max_matches {
+            return mc
+        }
+        let chunk: u8x16 = load(buf, chunk_off)
+        let xored: u8x16 = chunk .^ first_splat
+        let rmin: u8 = reduce_min(xored)
+        if rmin > zero_byte {
+            // No byte in this chunk matches first byte — skip entire chunk
+            chunk_off = chunk_off + 16
+        } else {
+            // Potential match — scalar scan this 16-byte region
+            let scan_end: i32 = chunk_off + 16
+            let mut i: i32 = chunk_off
+            while i < scan_end {
+                if mc >= max_matches {
+                    return mc
+                }
+                // Use !(a < b) && !(b < a) for u8 equality (Ea has no == on u8)
+                if !(buf[i] < first_byte) && !(first_byte < buf[i]) {
+                    let mut j: i32 = 1
+                    let mut matched: i32 = 1
+                    while j < needle_len {
+                        if i + j >= buf_len {
+                            matched = 0
+                            j = needle_len
+                        } else {
+                            if buf[i + j] < needle[j] {
+                                matched = 0
+                                j = needle_len
+                            } else {
+                                if needle[j] < buf[i + j] {
+                                    matched = 0
+                                    j = needle_len
+                                }
+                            }
+                        }
+                        j = j + 1
+                    }
+                    if matched == 1 {
+                        matches[mc] = base_offset + i
+                        mc = mc + 1
+                    }
+                }
+                i = i + 1
+            }
+            chunk_off = scan_end
+        }
+    }
+
+    // Remaining bytes (< 16) — scalar
+    let limit: i32 = buf_len - needle_len + 1
+    let mut i: i32 = chunk_off
+    while i < limit {
+        if mc >= max_matches {
+            return mc
+        }
+        if !(buf[i] < first_byte) && !(first_byte < buf[i]) {
+            let mut j: i32 = 1
+            let mut matched: i32 = 1
+            while j < needle_len {
+                if buf[i + j] < needle[j] {
+                    matched = 0
+                    j = needle_len
+                } else {
+                    if needle[j] < buf[i + j] {
+                        matched = 0
+                        j = needle_len
+                    }
+                }
+                j = j + 1
+            }
+            if matched == 1 {
+                matches[mc] = base_offset + i
+                mc = mc + 1
+            }
+        }
+        i = i + 1
+    }
+
+    return mc
+}
+
 // Main export: fused ChaCha20 decrypt + search
 export func chacha20_search(
     key: *restrict i32, nonce: *restrict i32, ctr_init: i32,
@@ -320,7 +418,7 @@ export func chacha20_search(
                             offset - overlap_len, overlap_temp)
 
         // Search current buffer
-        mc = search_buf(pt_buf, 256, needle, needle_len,
+        mc = search_buf_simd(pt_buf, 256, needle, needle_len,
                         matches, mc, max_matches, offset)
 
         // Save last (needle_len - 1) bytes to overlap for next iteration
@@ -403,7 +501,7 @@ export func chacha20_search(
                             offset - overlap_len, overlap_temp)
 
         // Search current 64-byte buffer
-        mc = search_buf(pt_buf, 64, needle, needle_len,
+        mc = search_buf_simd(pt_buf, 64, needle, needle_len,
                         matches, mc, max_matches, offset)
 
         // Save last (needle_len - 1) bytes to overlap
